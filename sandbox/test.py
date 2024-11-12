@@ -23,7 +23,12 @@ from core.visualize import visualize_model_outputs
 
 if __name__ == "__main__":
     torch.manual_seed(1212)
-    print(f"Seed: {np.random.seed()}")
+    
+    # Organic: 1107349783
+    # seed = np.random.randint(0, 1 << 31)
+    seed = 1107349783
+    np.random.seed(seed)
+    print(f"Seed: {seed}")
     
     dataset_name, n_classes = DATASETS["Common"][1]
     
@@ -87,6 +92,9 @@ if __name__ == "__main__":
     def residual_hook_fn(model_: nn.Module, input_: Any, output_: Any) -> Any:
         return input_ + tree_flatten(output_)[0][0]
     
+    def input_hook_fn(model_: nn.Module, input_: Any, output_: Any) -> Any:
+        return tree_flatten(input_)[0][0]
+    
     # SECTION: Experiment setup
     monitor = Monitor(model, OrderedDict({
         "vision_model.encoder.layers": OrderedDict({
@@ -96,9 +104,15 @@ if __name__ == "__main__":
             "layer_norm2": "layer_norm2",  # "norm2"
             "mlp": {
                 "": "mlp",
-                # "fc1": "mlp_fc1",
-                # "activation_fn": "mlp_activation",
-                # "fc2": "mlp_fc2",
+                "fc1": [
+                    ("mlp_fc1_input", input_hook_fn),
+                    ("mlp_fc1_output", Monitor.default_hook_fn),
+                ],
+                "activation_fn": [
+                    ("mlp_activation_input", input_hook_fn),
+                    ("mlp_activation_output", Monitor.default_hook_fn),
+                ],
+                "fc2": "mlp_fc2",
             }
         })
     }))

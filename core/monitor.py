@@ -30,7 +30,7 @@ class Monitor(object):
     
     @classmethod
     def default_hook_fn(cls, model_: nn.Module, input_: Any, output_: Any) -> Any:
-        return tree_flatten(output_)[0][0]
+        return tree_flatten(output_)[0][0].cpu()
     
     @classmethod
     def get_hook_for_output_key(
@@ -73,39 +73,42 @@ class Monitor(object):
     ) -> List[torch.utils.hooks.RemovableHandle]:
         
         removable_handles: List[torch.utils.hooks.RemovableHandle] = []
-        for attr, metric in utils.flatten_nested_dict(self.output_config).items():
-            if isinstance(metric, str):
-                hook_fn = Monitor.default_hook_fn
-            else:
-                metric, hook_fn = metric
-            
-            regex_components, pre_numeric = [], False
-            for subattr in reversed(attr.split(".")):
-                if subattr.isnumeric() or pre_numeric:
-                    pre_numeric = not pre_numeric
-                    regex_components.append(subattr)
+        for attr, metrics in utils.flatten_nested_dict(self.output_config).items():
+            if isinstance(metrics, str):
+                metrics = (metrics,)
+            for metric in metrics:
+                if isinstance(metric, str):
+                    hook_fn = Monitor.default_hook_fn
                 else:
-                    regex_components.append(f"{subattr}(\\.\\d+|)")
-            regex = "\\.".join(reversed(regex_components))
-            
-            found_modules = set()
-            for parameter_name, _ in utils.named_parameters(self.model):
-                m = re.match(regex, parameter_name)
-                if m is not None and m.group() not in found_modules:
-                    module = utils.rgetattr(self.model, m.group())
-                    indices = tuple(int(g.strip(".")) for g in m.groups() if g != "")
-                    
-                    if return_mode == "flat" or (return_mode == "array" and len(indices) == 0):
-                        hook = Monitor.get_hook_for_output_key(metric, output_dict, hook_fn)
-                    elif return_mode == "indices":
-                        hook = Monitor.get_hook_for_output_key(f"{metric}.{''.join(m.groups())}", output_dict, hook_fn)
-                    elif return_mode == "array":
-                        hook = Monitor.get_array_hook_for_output_key(metric, output_dict, hook_fn, indices)
+                    metric, hook_fn = metric
+                
+                regex_components, pre_numeric = [], False
+                for subattr in reversed(attr.split(".")):
+                    if subattr.isnumeric() or pre_numeric:
+                        pre_numeric = not pre_numeric
+                        regex_components.append(subattr)
+                    else:
+                        regex_components.append(f"{subattr}(\\.\\d+|)")
+                regex = "\\.".join(reversed(regex_components))
+                
+                found_modules = set()
+                for parameter_name, _ in utils.named_modules(self.model):
+                    m = re.match(regex, parameter_name)
+                    if m is not None and m.group() not in found_modules:
+                        module = utils.rgetattr(self.model, m.group())
+                        indices = tuple(int(g.strip(".")) for g in m.groups() if g != "")
+                        
+                        if return_mode == "flat" or (return_mode == "array" and len(indices) == 0):
+                            hook = Monitor.get_hook_for_output_key(metric, output_dict, hook_fn)
+                        elif return_mode == "indices":
+                            hook = Monitor.get_hook_for_output_key(f"{metric}.{''.join(m.groups())}", output_dict, hook_fn)
+                        elif return_mode == "array":
+                            hook = Monitor.get_array_hook_for_output_key(metric, output_dict, hook_fn, indices)
 
-                    removable_handles.append(
-                        module.register_forward_hook(hook)
-                    )
-                    found_modules.add(m.group())
+                        removable_handles.append(
+                            module.register_forward_hook(hook)
+                        )
+                        found_modules.add(f"{metric}:{m.group()}")
                     
         return removable_handles
     

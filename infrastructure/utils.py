@@ -341,6 +341,14 @@ def named_parameters(o: object):
         for k, v in vars(o).items():
             for parameter_name, parameter in named_parameters(v):
                 yield (f"{k}.{parameter_name}", parameter)
+                
+def named_modules(o: object):
+    if isinstance(o, nn.Module):
+        yield from o.named_modules()
+    elif hasattr(o, "__dict__"):
+        for k, v in vars(o).items():
+            for module_name, module in named_modules(v):
+                yield (f"{k}.{module_name}", module)
 
 def str_namespace(n: Namespace) -> str:
     return json.dumps(toJSON(n), indent=4)
