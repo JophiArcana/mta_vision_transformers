@@ -25,7 +25,7 @@ if __name__ == "__main__":
     torch.manual_seed(1212)
     dataset_name, n_classes = DATASETS["Common"][1]
     
-    model_type = "open_clip"
+    model_type = "clip"
     if model_type == "dinov2":
         base_model_name = "facebook/dinov2-base"
         
@@ -33,12 +33,20 @@ if __name__ == "__main__":
         model = Dinov2Model.from_pretrained(base_model_name)
         image_processor = AutoImageProcessor.from_pretrained(base_model_name)
         transform = lambda images: image_processor(images=images, return_tensors="pt")["pixel_values"].squeeze(0)
-    
+        
+    elif model_type == "clip":
+        base_model_name = "openai/clip-vit-large-patch14"
+        
+        from transformers import CLIPVisionModel, CLIPImageProcessor
+        model = CLIPVisionModel.from_pretrained(base_model_name)
+        image_processor = CLIPImageProcessor.from_pretrained(base_model_name)
+        transform = lambda images: image_processor(images=images, return_tensors="pt")["pixel_values"].squeeze(0)
+        
     elif model_type == "open_clip":
-        base_model_name = "hf-hub:laion/CLIP-ViT-l-14-laion2B-s32B-b82K"
+        base_model_name = "laion2b_s32b_b82k"
         
         import open_clip
-        model, transform = open_clip.create_model_from_pretrained(base_model_name)
+        model, _, transform = open_clip.create_model_and_transforms("ViT-L-14", pretrained=base_model_name)
         
     elif model_type == "vitmae":
         base_model_name = "facebook/dinov2-base"
@@ -75,19 +83,29 @@ if __name__ == "__main__":
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=50, shuffle=True, generator=torch.Generator(DEVICE))
     
     def residual_hook_fn(model_: nn.Module, input_: Any, output_: Any) -> Any:
-        print(type(input_[0]), len(input_))
         return input_ + tree_flatten(output_)[0][0]
     
     # SECTION: Experiment setup
     monitor = Monitor(model, OrderedDict({
-        "visual.transformer.resblocks": OrderedDict({
+        "vision_model.encoder.layers": OrderedDict({
             "": "layer_output",
-            "ln_1": "layer_norm1",  # "norm1"
-            "attn": "attention",   # "attention"
-            "ln_2": "layer_norm2",  # "norm2"
+            "layer_norm1": "layer_norm1",  # "norm1"
+            "self_attn": {
+                "": "attention",
+            },   # "attention"
+            "layer_norm2": "layer_norm2",  # "norm2"
             "mlp": "mlp",
         })
     }))
+    # monitor = Monitor(model, OrderedDict({
+    #     "visual.transformer.resblocks": OrderedDict({
+    #         "": "layer_output",
+    #         "ln_1": "layer_norm1",  # "norm1"
+    #         "attn": "attention",   # "attention"
+    #         "ln_2": "layer_norm2",  # "norm2"
+    #         "mlp": "mlp",
+    #     })
+    # }))
     # monitor = MonitoredVisionModel(model, {
     #     # "unet.down_blocks": "downblock",
     #     # "unet.up_blocks": "upblock",
