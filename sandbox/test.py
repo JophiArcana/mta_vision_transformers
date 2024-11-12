@@ -23,6 +23,8 @@ from core.visualize import visualize_model_outputs
 
 if __name__ == "__main__":
     torch.manual_seed(1212)
+    print(f"Seed: {np.random.seed()}")
+    
     dataset_name, n_classes = DATASETS["Common"][1]
     
     model_type = "clip"
@@ -90,11 +92,14 @@ if __name__ == "__main__":
         "vision_model.encoder.layers": OrderedDict({
             "": "layer_output",
             "layer_norm1": "layer_norm1",  # "norm1"
-            "self_attn": {
-                "": "attention",
-            },   # "attention"
+            "self_attn": "attention",   # "attention"
             "layer_norm2": "layer_norm2",  # "norm2"
-            "mlp": "mlp",
+            "mlp": {
+                "": "mlp",
+                # "fc1": "mlp_fc1",
+                # "activation_fn": "mlp_activation",
+                # "fc2": "mlp_fc2",
+            }
         })
     }))
     # monitor = Monitor(model, OrderedDict({

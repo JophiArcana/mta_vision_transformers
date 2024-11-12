@@ -121,9 +121,14 @@ def visualize_model_outputs(
                     color="black", zorder=12, label="cls_token" if image_idx == 0 else None
                 )
             else:
+                if mta_mask[image_idx, h_idx, w_idx]:
+                    mta_kwargs = {"linewidth": 1, "linestyle": "-",}
+                else:
+                    mta_kwargs = {"linewidth": 0.5, "linestyle": "-.",}
+                    
                 plt.plot(
-                    token_feature_norms.numpy(force=True), marker=".", linestyle="-" if mta_mask[image_idx, h_idx, w_idx] else "--",
-                    color=rgb_assignment[image_idx, h_idx, w_idx].numpy(force=True),
+                    token_feature_norms.numpy(force=True), marker=".",
+                    color=rgb_assignment[image_idx, h_idx, w_idx].numpy(force=True), **mta_kwargs,
                 )
         
         plt.title(f"{metric_name}_norm")
