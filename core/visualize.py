@@ -55,6 +55,7 @@ def visualize_model_outputs(
     
     # SECTION: Massive token heuristic
     def massive_token_heuristic(stacked_layer_output_dict: OrderedDict[str, torch.Tensor]) -> torch.Tensor:
+        print(stacked_layer_output_dict["layer_norm1"].shape)
         log_layer_norm1_norm = einops.rearrange(
             torch.norm(stacked_layer_output_dict["layer_norm1"], p=2, dim=-1).log()[14, :, 1:],
             "bsz (h w) -> bsz h w", h=H, w=W
@@ -108,11 +109,12 @@ def visualize_model_outputs(
     # SECTION: Per layer visualization code
     _, rgb_assignment = visualize_features_per_image(None, layer_output_dicts[-1]["layer_output"][0], plot=False)
     
+
     def visualize_feature_norms_per_layer(metric_name: str, t: torch.Tensor) -> torch.Tensor:
         feature_norms = torch.norm(t, p=2, dim=-1)
         for image_idx, token_idx in itertools.product(range(bsz), range(-1, H * W)):
-            # h_idx, w_idx = token_idx // W, token_idx % W
-            token_feature_norms = feature_norms[:, image_idx, token_idx]
+            h_idx, w_idx = token_idx // W, token_idx % W
+            token_feature_norms = feature_norms[:, image_idx, token_idx + 1]
             
             if token_idx == -1:
                 plt.plot(
@@ -121,8 +123,8 @@ def visualize_model_outputs(
                 )
             else:
                 plt.plot(
-                    token_feature_norms.numpy(force=True), marker=".", linestyle="-" if mta_mask.flatten(1, 2)[image_idx, token_idx] else "-.",
-                    color=rgb_assignment.flatten(1, 2)[image_idx, token_idx].numpy(force=True),
+                    token_feature_norms.numpy(force=True), marker=".", linestyle="-" if mta_mask[image_idx, h_idx, w_idx] else "--",
+                    color=rgb_assignment[image_idx, h_idx, w_idx].numpy(force=True),
                 )
         
         plt.title(f"{metric_name}_norm")
@@ -138,7 +140,14 @@ def visualize_model_outputs(
         visualize_feature_norms_per_layer(metric, stacked_metric_output)
     raise Exception()
     
-
+    stacked_layer_outputs = einops.rearrange(
+        torch.stack([
+            layer_output_dict["layer_output"][0]
+            for layer_output_dict in layer_output_dicts
+        ], dim=0)[:, :, 1:],
+        "l bsz (h w) c -> l bsz h w c", h=H, w=W
+    )
+    
     # SECTION: Visualize layer output norms across layers
     for token, rgb in zip(
         torch.unbind(stacked_layer_outputs.flatten(-4, -2), dim=-2),
