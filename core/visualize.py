@@ -55,14 +55,13 @@ def visualize_model_outputs(
     
     # SECTION: Massive token heuristic
     def massive_token_heuristic(stacked_layer_output_dict: OrderedDict[str, torch.Tensor]) -> torch.Tensor:
-        print(stacked_layer_output_dict["layer_norm1"].shape)
-        log_layer_norm1_norm = einops.rearrange(
-            torch.norm(stacked_layer_output_dict["layer_norm1"], p=2, dim=-1).log()[14, :, 1:],
+        log_norms = einops.rearrange(
+            torch.norm(stacked_layer_output_dict["layer_output"], p=2, dim=-1).log()[14, :, 1:],
             "bsz (h w) -> bsz h w", h=H, w=W
         )
-        flattened_norms = torch.sort(torch.flatten(log_layer_norm1_norm), dim=0).values
-        cutoff = torch.argmin(torch.diff(flattened_norms, dim=0), dim=0)
-        mask = log_layer_norm1_norm > flattened_norms[cutoff]
+        flattened_norms = torch.sort(torch.flatten(log_norms), dim=0).values
+        cutoff = torch.argmax(torch.diff(flattened_norms, dim=0), dim=0)
+        mask = log_norms > flattened_norms[cutoff]
         return mask
     mta_mask = massive_token_heuristic(stacked_layer_output_dict)
     
