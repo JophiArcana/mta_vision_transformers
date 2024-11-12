@@ -1,32 +1,113 @@
 #%%
-import datasets
+import os
+import sys
+sys.path.append("/workspace/mta_vision_transformers/")
+from collections import OrderedDict
+from typing import Any
+
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.utils.data
 from matplotlib import pyplot as plt
+from torch.utils._pytree import tree_flatten
 from transformers import CLIPVisionModel
 
-from infrastructure.dataset import DATASETS
 from infrastructure.settings import DEVICE, DTYPE
+from dataset.construct import ImageDataset
+from dataset.library import DATASETS
+
+from core.monitor import Monitor
+from core.visualize import visualize_model_outputs
 
 
 if __name__ == "__main__":
-    # M = nn.Parameter(torch.randn((1000, 5)))
-    # # V, L = NCUT(num_eig=10, device=DEVICE).fit_transform(M)
-    # # print(V.shape, L.shape)
-    # # print(L, V[:, 0])
-    # indices = torch_cluster.fps(M, batch=torch.arange(1000), ratio=0.25)
-    # # print(indices, indices.shape)
-    # raise Exception()
-
+    torch.manual_seed(1212)
     dataset_name, n_classes = DATASETS["Common"][1]
-    base_model_name = "facebook/dino-vitb8"
-
-    # SECTION: Dataset setup
-    dataset = datasets.load_dataset(dataset_name)
-    dataset_size = dataset["train"].num_rows
-    images = [sample["image"] for sample in (*dataset["train"],)]
     
-    print(len(images))
+    model_type = "open_clip"
+    if model_type == "dinov2":
+        base_model_name = "facebook/dinov2-base"
+        
+        from transformers import Dinov2Model, AutoImageProcessor
+        model = Dinov2Model.from_pretrained(base_model_name)
+        image_processor = AutoImageProcessor.from_pretrained(base_model_name)
+        transform = lambda images: image_processor(images=images, return_tensors="pt")["pixel_values"].squeeze(0)
+    
+    elif model_type == "open_clip":
+        base_model_name = "hf-hub:laion/CLIP-ViT-l-14-laion2B-s32B-b82K"
+        
+        import open_clip
+        model, transform = open_clip.create_model_from_pretrained(base_model_name)
+        
+    elif model_type == "vitmae":
+        base_model_name = "facebook/dinov2-base"
+        
+        from transformers import ViTMAEModel, VitMatteImageProcessor
+        model = ViTMAEModel.from_pretrained(base_model_name)
+        image_processor = VitMatteImageProcessor.from_pretrained(base_model_name)
+        transform = lambda images: image_processor(images=images, return_tensors="pt")["pixel_values"].squeeze(0)
+        
+    elif model_type == "sam":
+        base_model_name = "facebook/sam-vit-base"
+        
+        from transformers import SamModel, SamImageProcessor
+        model = SamModel.from_pretrained(base_model_name)
+        image_processor = SamImageProcessor.from_pretrained(base_model_name)
+        transform = lambda images: image_processor(images=images, return_tensors="pt")["pixel_values"].squeeze(0)
+        
+    elif model_type == "dit":
+        # base_model_name = "stabilityai/stable-diffusion-3.5-medium"
+        base_model_name = "sd-legacy/stable-diffusion-v1-5"
+        
+        from diffusers import StableDiffusionPipeline
+        model = StableDiffusionPipeline.from_pretrained(base_model_name)
+        transform = None
+        
+        # model = BeitModel.from_pretrained(base_model_name)
+        # image_processor = BeitImageProcessor.from_pretrained(base_model_name)
+        # transform = lambda images: image_processor(images=images, return_tensors="pt")["pixel_values"].squeeze(0)
+        
+    model = model.to(DEVICE)
+    
+    # SECTION: Dataset setup
+    dataset = ImageDataset(dataset_name, transform, split="train", return_original_image=True)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=50, shuffle=True, generator=torch.Generator(DEVICE))
+    
+    def residual_hook_fn(model_: nn.Module, input_: Any, output_: Any) -> Any:
+        print(type(input_[0]), len(input_))
+        return input_ + tree_flatten(output_)[0][0]
+    
+    # SECTION: Experiment setup
+    monitor = Monitor(model, OrderedDict({
+        "visual.transformer.resblocks": OrderedDict({
+            "": "layer_output",
+            "ln_1": "layer_norm1",  # "norm1"
+            "attn": "attention",   # "attention"
+            "ln_2": "layer_norm2",  # "norm2"
+            "mlp": "mlp",
+        })
+    }))
+    # monitor = MonitoredVisionModel(model, {
+    #     # "unet.down_blocks": "downblock",
+    #     # "unet.up_blocks": "upblock",
+    #     "unet.down_blocks.attentions": "downblock_attention",
+    #     "unet.up_blocks.attentions": "upblock_attention",
+    # })
+    
+    # output_dict = monitor.reset(return_mode="array")
+    # with torch.no_grad():
+    #     output = model("a photo of an astronaut riding a horse on mars")
+    
+    # print(output_dict.keys())
+    # downblock_attention_output = output_dict["downblock_attention"]
+    # print(type(downblock_attention_output), downblock_attention_output.shape)
+    # # print([block_output[0].shape for block_output in downblock_attention00_output])
+        
+    # raise Exception()
+    
+    original_images, images = next(iter(dataloader))
+    visualize_model_outputs(monitor, original_images, images)
     raise Exception()
 
     def process_grayscale(im):

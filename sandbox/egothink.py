@@ -5,7 +5,7 @@ import datasets
 
 from transformers import CLIPImageProcessor, CLIPVisionConfig, CLIPVisionModel, Dinov2Model
 
-from infrastructure.dataset import DATASETS
+from dataset.library import DATASETS
 
 
 if __name__ == "__main__":

@@ -334,6 +334,14 @@ def toJSON(o: object):
         except TypeError:
             return str(o)
 
+def named_parameters(o: object):
+    if isinstance(o, nn.Module):
+        yield from o.named_parameters()
+    elif hasattr(o, "__dict__"):
+        for k, v in vars(o).items():
+            for parameter_name, parameter in named_parameters(v):
+                yield (f"{k}.{parameter_name}", parameter)
+
 def str_namespace(n: Namespace) -> str:
     return json.dumps(toJSON(n), indent=4)
 
@@ -369,6 +377,8 @@ def flatten_nested_dict(d: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in d.items():
             if isinstance(v, dict):
                 _flatten_nested_dict((*s, k), v)
+            elif k == "":
+                result[".".join((*s,))] = v
             else:
                 result[".".join((*s, k))] = v
     _flatten_nested_dict((), d)
