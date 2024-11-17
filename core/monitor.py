@@ -30,7 +30,7 @@ class Monitor(object):
     
     @classmethod
     def default_hook_fn(cls, model_: nn.Module, input_: Any, output_: Any) -> Any:
-        return tree_flatten(output_)[0][0].cpu()
+        return tree_flatten(output_)[0][0]
     
     @classmethod
     def get_hook_for_output_key(

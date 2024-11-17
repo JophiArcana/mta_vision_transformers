@@ -36,7 +36,12 @@ class ImageDataset(Dataset):
             transform_list = [ImageDataset.default_transform, self.transform]
         else:
             transform_list = [self.transform]
-        return tuple(transform(self.data[idx]["image"]).to(DEVICE) for transform in transform_list)
+        def add_noise(t: torch.Tensor) -> torch.Tensor:
+            return t + 0.0 * torch.randn_like(t)
+        return tuple(
+            transform(self.data[idx]["image"]).to(DEVICE)
+            for transform in transform_list
+        )
 
 
 
