@@ -4,6 +4,7 @@ import torch
 
 
 DEVICE: str = "cuda:0"
+OUTPUT_DEVICE: str = "cpu"
 DTYPE: torch.dtype = torch.float32
 PROJECT_NAME: str = "mta_vision_transformers"
 PROJECT_PATH: str = os.getcwd()[:os.getcwd().find(PROJECT_NAME)] + PROJECT_NAME

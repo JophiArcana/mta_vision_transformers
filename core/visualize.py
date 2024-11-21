@@ -3,30 +3,44 @@ from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Literal, Set, Tuple
 
 import einops
+import matplotlib.colors
 import scipy.spatial
 import torch
 import torch.nn.functional as Fn
 import torchvision.transforms as transforms
-from matplotlib import patches
 from matplotlib import pyplot as plt
 from ncut_pytorch import NCUT, rgb_from_tsne_3d
 from sklearn.manifold import TSNE
 from torch.utils._pytree import tree_flatten
 
-from infrastructure.settings import DEVICE
+from infrastructure.settings import DEVICE, OUTPUT_DEVICE
 from infrastructure import utils
 from core.monitor import Monitor
 
 
 H = W = 16
 num_visualized_images = 8
-DEFAULT_LAYER_INDICES = [*range(6, 8)]
-    
+DEFAULT_LAYER_INDICES = [*range(9, 12)]
+
+
+def pad_tensor_outputs(ts: List[torch.Tensor], dim: int) -> List[torch.Tensor]:
+    result, d = [], max(t.shape[dim] for t in ts)
+    for t in ts:
+        t = t.to()
+        l = t.shape[dim]
+        pad_length = d - l
+        pad = torch.full((*t.shape[:dim], pad_length, *t.shape[dim + 1:]), torch.nan)
+        result.append(torch.cat((
+            torch.index_select(t, dim, torch.arange(l - H * W)),
+            pad, torch.index_select(t, dim, torch.arange(l - H * W, l)),
+        ), dim=dim))
+    return result
+
     
 def visualize_images_with_mta(original_images: torch.Tensor, mta_mask: torch.Tensor) -> None:
     fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(2 * num_visualized_images, 2))
     for image_idx, original_image in enumerate(shift_channels(original_images[:num_visualized_images])):
-        mask = transforms.Resize(original_image.shape[:2])(mta_mask[None, image_idx].to(dtype=torch.float, device=DEVICE))[0, ..., None]
+        mask = transforms.Resize(original_image.shape[:2])(mta_mask[None, image_idx].to(dtype=torch.float))[0, ..., None]
         image = (1 - mask) * original_image + mask * torch.tensor((1.0, 0.0, 0.0))
         
         axs[image_idx].imshow(image.numpy(force=True))
@@ -39,9 +53,16 @@ def shift_channels(images_: torch.Tensor) -> torch.Tensor:
     return einops.rearrange(images_, "bsz c h w -> bsz h w c")
 
 
+def get_mta_mask_from_indices(mta_indices: torch.Tensor):
+    bsz = mta_indices.shape[0]
+    mask = torch.full((bsz, H, W), False)
+    mask[torch.arange(bsz)[:, None], mta_indices // W, mta_indices % W] = True
+    return mask
+
+
 def massive_token_heuristic(stacked_layer_output_dict: OrderedDict[str, torch.Tensor]) -> torch.Tensor:
     log_norms = einops.rearrange(
-        torch.norm(stacked_layer_output_dict["layer_output"], p=2, dim=-1).log()[15, :, 1:],
+        torch.norm(stacked_layer_output_dict["layer_output"][15, :, -H * W:], p=2, dim=-1).log(),
         "bsz (h w) -> bsz h w", h=H, w=W
     )
     flattened_norms = torch.sort(torch.flatten(log_norms), dim=0).values
@@ -57,7 +78,7 @@ def visualize_features_per_image(metric_name: str, t: torch.Tensor, plot: bool =
     ncut_features, eigenvalues = ncut.fit_transform(t.flatten(0, 1))
     rgb_features = rgb_from_tsne_3d(ncut_features)[1]
     rgb_features = einops.rearrange(
-        rgb_features.reshape(bsz, -1, 3)[:, 1:],
+        rgb_features.reshape(bsz, -1, 3)[:, -H * W:],
         "bsz (h w) c -> bsz h w c", h=H, w=W
     )
     
@@ -70,14 +91,23 @@ def visualize_features_per_image(metric_name: str, t: torch.Tensor, plot: bool =
         plt.show()
 
     return einops.rearrange(
-        ncut_features.unflatten(0, (bsz, -1))[:, 1:],
+        ncut_features.unflatten(0, (bsz, -1))[:, -H * W:],
         "bsz (h w) c -> bsz h w c", h=H, w=W
-    ), rgb_features.to(DEVICE)
+    ), rgb_features.to(OUTPUT_DEVICE)
+    
+
+def get_rgb_colors(t: torch.Tensor, mta_mask: torch.Tensor, binary: bool = False) -> torch.Tensor:
+    if binary:
+        r = torch.tensor(matplotlib.colors.to_rgb("red"))
+        b = torch.tensor(matplotlib.colors.to_rgb("blue"))
+        return torch.where(mta_mask[..., None], r, b)
+    else:
+        return visualize_features_per_image(None, t, plot=False)[1]
     
 
 def visualize_feature_norms_per_image(metric_name: str, t: torch.Tensor) -> torch.Tensor:
     feature_norms = einops.rearrange(
-        torch.norm(t, p=2, dim=-1)[:, 1:],
+        torch.norm(t, p=2, dim=-1)[:, -H * W:],
         "bsz (h w) -> bsz h w", h=H, w=W
     )
     assert torch.all(feature_norms >= 0), "Computed norms should be greater than 0."
@@ -95,6 +125,7 @@ def visualize_feature_norms_per_layer(
     metric_name: str,
     t: torch.Tensor,
     mta_mask: torch.Tensor,
+    mta_indices: torch.Tensor,
     rgb_assignment: torch.Tensor,
     fns: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> None:
@@ -106,14 +137,29 @@ def visualize_feature_norms_per_layer(
     for i, (fn_name, fn) in enumerate(fns.items()):
         feature_norms = fn(t)
         
-        for image_idx, token_idx in itertools.product(range(bsz), range(-1, H * W)):
+        min_token_idx = H * W - feature_norms.shape[-1]
+        for image_idx, token_idx in itertools.product(range(bsz), range(min_token_idx, H * W)):
             h_idx, w_idx = token_idx // W, token_idx % W
-            token_feature_norms = feature_norms[:, image_idx, token_idx + 1]
+            token_feature_norms = feature_norms[:, image_idx, token_idx - min_token_idx]
             
-            if token_idx == -1:
+            if token_idx == min_token_idx:
                 axs[i].plot(
                     token_feature_norms.numpy(force=True), marker=".",
-                    color="black", zorder=12, label="cls_token" if image_idx == 0 else None
+                    color="black", linewidth=1, zorder=12, label="cls_token" if image_idx == 0 else None
+                )
+            elif token_idx < 0:
+                if mta_indices is not None:
+                    nan_idx = torch.argmax(~torch.isnan(token_feature_norms).to(torch.int))
+                    mta_idx = mta_indices[image_idx, token_idx - min_token_idx - 1]
+                    axs[i].plot(
+                        [nan_idx - 1, nan_idx],
+                        [feature_norms[nan_idx - 1, image_idx, mta_idx - min_token_idx], token_feature_norms[nan_idx]],
+                        color="midnightblue", linewidth=0.5, linestyle="--",
+                    )
+                
+                axs[i].plot(
+                    token_feature_norms.numpy(force=True), marker=".",
+                    color="gold", linewidth=0.5, label="register_token" if token_idx == min_token_idx + 1 and image_idx == 0 else None
                 )
             else:
                 if mta_mask[image_idx, h_idx, w_idx]:
@@ -239,7 +285,7 @@ def visualize_feature_norms_by_channel(
     
     fig, axs = plt.subplots(nrows=2, ncols=len(layer_indices), figsize=(2 * len(layer_indices), 10 / 7), sharey=True)
     for i, layer_idx in enumerate(layer_indices):
-        feature_values = einops.rearrange(t[layer_idx, :, 1:], "bsz (h w) c -> bsz h w c", h=H, w=W)
+        feature_values = einops.rearrange(t[layer_idx, :, -H * W:], "bsz (h w) c -> bsz h w c", h=H, w=W)
         demeaned_feature_values = feature_values - torch.mean(feature_values.flatten(0, -2), dim=0)
         
         def plot_channel_norm(ax, values: torch.Tensor, prefix: str):
@@ -263,83 +309,64 @@ def visualize_feature_values_by_pca(
     mean: Literal[None, "local", "global"],
     projection_mode: Literal["pca", "tsne"],
     weights: torch.Tensor = None,
-    plot_directions: bool = False,
     convex_hull: bool = True,
     layer_indices: List[int] = None,
 ) -> None:
-    t = t.to(DEVICE)
     bsz = t.shape[1]
-    nrows = 1 + int(plot_directions)
-    
     if layer_indices is None:
         layer_indices = DEFAULT_LAYER_INDICES
     
-    plt.figure(figsize=(2 * len(layer_indices), 2 * nrows))
+    fig, axs = plt.subplots(nrows=1, ncols=len(layer_indices), figsize=(2 * len(layer_indices), 2), subplot_kw={"projection": "3d"})
     for i, layer_idx in enumerate(layer_indices):
-        feature_values = einops.rearrange(t[layer_idx, :, 1:], "bsz (h w) c -> bsz h w c", h=H, w=W)
-        cls_token_feature_values = t[layer_idx, :, 0]
+        feature_values = t[layer_idx]
+        
+        if feature_values.shape[-2] == H * W + 1 or torch.any(torch.isnan(feature_values)):
+            mask = torch.cat((
+                torch.full((bsz, feature_values.shape[-2] - H * W), False),
+                torch.flatten(mta_mask, start_dim=1, end_dim=2),
+            ), dim=-1)
+        else:
+            mask = torch.full(feature_values.shape[:-1], False)
+            mask[:, 1:-H * W] = True
+        inverse_mask = ~torch.any(torch.isnan(feature_values), dim=-1) & ~mask
                 
-        if projection_mode == "pca":
-            global_feature_mean = 0 if mean is None else torch.mean(feature_values.flatten(0, -2), dim=0)
+        if projection_mode == "pca":    
+            global_feature_mean = 0 if mean is None else torch.mean(feature_values[~torch.any(torch.isnan(feature_values), dim=-1)], dim=0)
             demeaned_feature_values = feature_values - global_feature_mean
-         
-            _, S_ma, V_ma = torch.pca_lowrank(demeaned_feature_values[mta_mask], q=1, center=(mean == "local"))
-            S_ma /= torch.sum(mta_mask) ** 0.5
-            _, S_nonma, V_nonma = torch.pca_lowrank(demeaned_feature_values[~mta_mask], q=2, center=(mean == "local"))
-            S_nonma /= torch.sum(~mta_mask) ** 0.5
+
+            _, S_ma, V_ma = torch.pca_lowrank(demeaned_feature_values[mask], q=1, center=(mean == "local"))
+            S_ma /= torch.sum(mask) ** 0.5
+            _, S_nonma, V_nonma = torch.pca_lowrank(demeaned_feature_values[inverse_mask], q=2, center=(mean == "local"))
+            S_nonma /= torch.sum(inverse_mask) ** 0.5
             
             V = torch.cat((V_ma, V_nonma), dim=-1)
             compressed_features = demeaned_feature_values @ V
             
-            
-            if plot_directions:
-                ax1 = plt.subplot(nrows, len(layer_indices), len(layer_indices) + i + 1)
-                ax1.plot((V_ma * S_ma)[:, 0].numpy(force=True), label="mt_pca")
-                for i, v in enumerate(torch.unbind((V_nonma * S_nonma), dim=1)):
-                    ax1.plot(v.numpy(force=True), label=f"non_mt_pca{i}")
-                    
-                if weights is not None:
-                    layer_weights = weights[layer_idx]
-                    layer_weight_norms = (layer_weights ** 2).mean(dim=-1) ** 0.5
-                    
-                    top_weights, top_indices = torch.topk(layer_weight_norms, k=20, sorted=False)
-                    top_indices, sort_idx = torch.sort(top_indices)
-                    top_weights = top_weights[sort_idx] * 100
-                    # top_weights = (top_weights - top_weights.min()) / (top_weights.max() - top_weights.min())
-                    
-                    V_sign = torch.sign(torch.take_along_dim(V, torch.argmax(V.abs(), dim=-1, keepdim=True), dim=-1))[:, 0]
-                    ax1.scatter(
-                        top_indices.numpy(force=True), (top_weights * V_sign[top_indices]).numpy(force=True),
-                        color="black", s=16, zorder=10, label="layer_norm2_weights"
-                    )
-
-                ax1.set_title(f"Layer {layer_idx}: {metric_name}_pca_directions")
-                # ax1.legend(fontsize=6)
         elif projection_mode == "tsne":
             compressed_features = torch.tensor(TSNE(n_components=3).fit_transform(feature_values.flatten(0, -2).numpy(force=True))).reshape(*mta_mask.shape, -1)   
         
-        subsample_mask = ~mta_mask & (torch.rand(mta_mask.shape) < 0.1)
-        ax0 = plt.subplot(nrows, len(layer_indices), i + 1, projection="3d")
-
-        ax0.scatter(*compressed_features[mta_mask].mT.numpy(force=True), color=rgb_assignment[mta_mask].numpy(force=True), s=10)
-        ax0.scatter(*compressed_features[subsample_mask].mT.numpy(force=True), color=rgb_assignment[subsample_mask].numpy(force=True), s=1, alpha=1.0)
+        def to_rgb_mask(m: torch.Tensor) -> torch.Tensor:
+            return m[:, -H * W:].view(bsz, H, W)
         
-        compressed_cls_features = (cls_token_feature_values - global_feature_mean) @ V
-        ax0.scatter(*compressed_cls_features.mT.numpy(force=True), s=20, color="black", label="cls_token")
+        subsample_mask = inverse_mask & (torch.arange(-feature_values.shape[-2], 0) >= -H * W) & (torch.rand(mask.shape) < 0.1)
+        
+        axs[i].scatter(*compressed_features[mask].mT.numpy(force=True), color=rgb_assignment[to_rgb_mask(mask)].numpy(force=True), s=10)
+        axs[i].scatter(*compressed_features[subsample_mask].mT.numpy(force=True), color=rgb_assignment[to_rgb_mask(subsample_mask)].numpy(force=True), s=1, alpha=1.0)
+        axs[i].scatter(*compressed_features[:, 0].mT.numpy(force=True), s=20, color="black", label="cls_token")
         
         if convex_hull:
             hull_kwargs = {"linewidth": 0.3, "edgecolor": "black", "alpha": 1.0}
             
-            vertices = compressed_features[mta_mask]
-            hull = scipy.spatial.ConvexHull(compressed_features[mta_mask].numpy(force=True))
-            ax0.plot_trisurf(*vertices.mT.numpy(force=True), triangles=hull.simplices, cmap="pink", **hull_kwargs)
+            vertices = compressed_features[mask]
+            hull = scipy.spatial.ConvexHull(vertices.numpy(force=True))
+            axs[i].plot_trisurf(*vertices.mT.numpy(force=True), triangles=hull.simplices, cmap="pink", **hull_kwargs)
             
-            cls_vertices = compressed_cls_features
-            cls_hull = scipy.spatial.ConvexHull(compressed_cls_features.numpy(force=True))
-            ax0.plot_trisurf(*cls_vertices.mT.numpy(force=True), triangles=cls_hull.simplices, cmap="bone", **hull_kwargs)
+            cls_vertices = compressed_features[:, 0]
+            cls_hull = scipy.spatial.ConvexHull(cls_vertices.numpy(force=True))
+            axs[i].plot_trisurf(*cls_vertices.mT.numpy(force=True), triangles=cls_hull.simplices, cmap="bone", **hull_kwargs)
         
-        ax0.set_title(f"Layer {layer_idx}: {metric_name}_pca_values")
-        ax0.legend()
+        axs[i].set_title(f"Layer {layer_idx}: {metric_name}_pca_values")
+        axs[i].legend()
 
     plt.show()
 
@@ -350,13 +377,13 @@ def visualize_fc_weights(
     mta_mask: torch.Tensor,
     mean: Literal[None, "local", "global"],
     layer_indices: List[int] = None,
-) -> None:  
+) -> None:
     if layer_indices is None:
         layer_indices = DEFAULT_LAYER_INDICES
     
     fig, axs = plt.subplots(nrows=1, ncols=len(layer_indices), figsize=(7 * len(layer_indices), 5))
     for i, layer_idx in enumerate(layer_indices):
-        feature_values = einops.rearrange(t[layer_idx, :, 1:], "bsz (h w) c -> bsz h w c", h=H, w=W)
+        feature_values = einops.rearrange(t[layer_idx, :, -H * W:], "bsz (h w) c -> bsz h w c", h=H, w=W)
         global_feature_mean = 0 if mean is None else torch.mean(feature_values.flatten(0, -2), dim=0)
         demeaned_feature_values = feature_values - global_feature_mean
         

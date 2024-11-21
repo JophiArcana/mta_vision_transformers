@@ -9,6 +9,7 @@ import torch.utils.hooks
 from torch.utils._pytree import tree_flatten
 
 from infrastructure import utils
+from infrastructure.settings import OUTPUT_DEVICE
 
 
 class Monitor(object):
@@ -30,7 +31,7 @@ class Monitor(object):
     
     @classmethod
     def default_hook_fn(cls, model_: nn.Module, input_: Any, output_: Any) -> Any:
-        return tree_flatten(output_)[0][0]
+        return tree_flatten(output_)[0][0].to(OUTPUT_DEVICE)
     
     @classmethod
     def get_hook_for_output_key(
@@ -40,7 +41,7 @@ class Monitor(object):
         hook_fn: Callable[[nn.Module, Any, Any], Any],
     ) -> Callable[[nn.Module, Any, Any], None]:
         def hook(model_: nn.Module, input_: Any, output_: Any) -> None:
-            output_dict.setdefault(output_key, []).append(hook_fn(model_, input_, output_))
+            output_dict.setdefault(output_key, []).append(hook_fn(model_, input_, output_).to(OUTPUT_DEVICE))
         return hook
     
     @classmethod
@@ -63,7 +64,7 @@ class Monitor(object):
             
             if output_arr[indices] is None:
                 output_arr[indices] = []
-            output_arr[indices].append(hook_fn(model_, input_, output_))
+            output_arr[indices].append(hook_fn(model_, input_, output_).to(OUTPUT_DEVICE))
         return hook
     
     def add_hooks_to_vision_model(
