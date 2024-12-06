@@ -36,7 +36,7 @@ class ImageDataset(Dataset):
             transform_list = [ImageDataset.default_transform, self.transform]
         else:
             transform_list = [self.transform]
-            
+            0
         def add_noise(t: torch.Tensor) -> torch.Tensor:
             return t + 0.0 * torch.randn_like(t)
         flip = transforms.RandomHorizontalFlip(1.0)
