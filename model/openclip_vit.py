@@ -14,10 +14,10 @@ class OpenCLIPViT(nn.Module):
     def __init__(
         self,
         cutoff: Dict[str, Dict[str, Callable[[torch.Tensor], torch.Tensor]]],
-        mode: Literal["concatenate", "mean_substitution"] = "concatenate",
+        mode: Literal["concatenation", "mean_substitution", "permutation"] = "concatenate",
     ):
         super().__init__()
-        model, _, _ = open_clip.create_model_and_transforms("ViT-L-14", pretrained="openai")
+        model, _, _ = open_clip.create_model_and_transforms("ViT-L-14", pretrained="openai", force_quick_gelu=True)
         
         mta_masks = {}
         def new_transformer_forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
@@ -72,7 +72,7 @@ class OpenCLIPViT(nn.Module):
                     
                     mta_mask = projection_condition(projections)
                     
-                    if mode == "concatenate":
+                    if mode == "concatenation":
                         # Add top-k tokens as register tokens after cls
                         r = torch.sum(mta_mask, dim=-1)
                         max_r = torch.max(r).item()
@@ -134,12 +134,16 @@ class OpenCLIPViT(nn.Module):
                         image_x_filled = einops.rearrange(image_x_grid_filled, "b c h w -> b (h w) c")
                         x = torch.cat((x[:, :1], image_x_filled, x[:, N + 1:], register_tokens), dim=1)
                     
-                    elif mode == "mean_substitution":
+                    else:
                         mta_indices = torch.unbind(torch.argwhere(mta_mask) + torch.tensor([0, 1]), dim=-1)
-                        x[mta_indices] = torch.mean(x[mta_indices], dim=0)
-                        
-                        mta_mask = einops.rearrange(mta_mask, "b (h w) -> b h w", h=H, w=W)
-                    
+                        if mode == "mean_substitution":
+                            x[mta_indices] = torch.mean(x[mta_indices], dim=0)
+                            
+                        elif mode == "permutation":
+                            torch.seed()
+                            x[mta_indices] = x[mta_indices][torch.randperm(len(mta_indices[0]), device=DEVICE)]
+
+                        mta_mask = einops.rearrange(mta_mask, "b (h w) -> b h w", h=H, w=W)                    
                     ############################################################################################################
 
                     attn_mask = torch.repeat_interleave(_attn_mask, n_heads, dim=0)

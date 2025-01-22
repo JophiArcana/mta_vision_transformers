@@ -11,7 +11,8 @@ import torch.nn.functional as Fn
 import torchvision.transforms as transforms
 from matplotlib import pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from ncut_pytorch import NCUT, rgb_from_tsne_3d
+from nystrom_ncut import rgb_from_tsne_3d, rgb_from_euclidean_tsne_3d
+# from ncut_pytorch import rgb_from_tsne_3d
 from sklearn.manifold import TSNE
 from torch.utils._pytree import tree_flatten
 
@@ -23,12 +24,58 @@ from core.qk import qk_intersection, qk_projection_variance
 
 H = W = 16
 N = H * W
-num_visualized_images = 8
+num_visualized_images = 6
 DEFAULT_LAYER_INDICES = [*range(9, 12)]
+
+
+new = True
+
+def compute_ncut_features(features: torch.Tensor):
+    rbf_ncut = NCUT(n_components=100, distance="rbf")
+    cosine_ncut = NCUT(n_components=100, distance="cosine")
+    # return NCUT(num_eig=100, num_sample=10000, distance="rbf")
+    
+def generate_NCUT():
+    num_sample = 20000
+    if new:
+        from nystrom_ncut import NCut, SampleConfig
+        return NCut(
+            n_components=100,
+            sample_config=SampleConfig(
+                method="fps",
+                # method="fps_recursive",
+                num_sample=num_sample,
+                fps_dim=12,
+                # n_iter=1,
+            ),
+            distance="rbf",
+            eig_solver="svd_lowrank"
+        )
+    else:
+        from ncut_pytorch import NCUT
+        return NCUT(num_eig=100, num_sample=num_sample, distance="rbf")
+    
+def generate_rgb_from_tsne_3d(features):
+    if new:
+        from nystrom_ncut import rgb_from_tsne_3d, rgb_from_euclidean_tsne_3d
+        # return rgb_from_tsne_3d(features)
+        return rgb_from_euclidean_tsne_3d(features, num_sample=1000)
+    else:
+        from ncut_pytorch import rgb_from_tsne_3d
+        return rgb_from_tsne_3d(features)[1]
 
 
 def get_image_tokens(x_: torch.Tensor) -> torch.Tensor:
     return x_[..., 1:N + 1, :]
+
+
+def demean(t: torch.Tensor) -> torch.Tensor:
+    return t - torch.mean(t.flatten(0, -2), dim=0)
+
+
+def svd(t: torch.Tensor, center: bool) -> torch.Tensor:
+    mean = torch.mean(t.flatten(0, -2), dim=0) if center else 0.0
+    return torch.linalg.svd(t - mean, full_matrices=False)
 
 
 def pad_tensor_outputs(ts: List[torch.Tensor], dim: int) -> List[torch.Tensor]:
@@ -42,11 +89,14 @@ def pad_tensor_outputs(ts: List[torch.Tensor], dim: int) -> List[torch.Tensor]:
     return result
 
     
-def visualize_images_with_mta(original_images: torch.Tensor, mta_mask: torch.Tensor) -> None:
+def visualize_images_with_mta(original_images: torch.Tensor, mta_mask: torch.Tensor = None) -> None:
     fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(2 * num_visualized_images, 2))
     for image_idx, original_image in enumerate(shift_channels(original_images[:num_visualized_images])):
-        mask = transforms.Resize(original_image.shape[:2])(mta_mask[None, image_idx].to(dtype=torch.float))[0, ..., None]
-        image = (1 - mask) * original_image + mask * torch.tensor((1.0, 0.0, 0.0))
+        if mta_mask is not None:
+            mask = transforms.Resize(original_image.shape[:2])(mta_mask[None, image_idx].to(dtype=torch.float))[0, ..., None]
+            image = (1 - mask) * original_image + mask * torch.tensor((1.0, 0.0, 0.0))
+        else:
+            image = original_image
         
         axs[image_idx].imshow(image.numpy(force=True))
         axs[image_idx].axis("off")
@@ -79,15 +129,16 @@ def get_rgb_colors(t: torch.Tensor, mta_mask: torch.Tensor, use_all: bool) -> to
         np.random.seed(SEED)
         
         bsz, n, _ = t.shape
-        ncut = NCUT(num_eig=100, distance="rbf", indirect_connection=False, device=DEVICE)
+        ncut = generate_NCUT()
         if use_all:
             mask = ~torch.any(torch.isnan(t), dim=-1)
         else:
-            mask = (torch.arange(bsz)[:, None], (1 <= torch.arange(n)) & (torch.arange(n) < N + 1))
+            mask = torch.full((bsz, n), False)
+            mask[:, 1:N + 1] = True
         
-        ncut_features, _ = ncut.fit_transform(t[mask])
+        ncut_features = ncut.fit_transform(t[mask].to(DEVICE))[0].to(OUTPUT_DEVICE)
         result = torch.full((bsz, n, 3), torch.nan)
-        result[mask] = rgb_from_tsne_3d(ncut_features)[1]
+        result[mask] = generate_rgb_from_tsne_3d(ncut_features)
             
         return einops.rearrange(
             get_image_tokens(result),
@@ -96,6 +147,7 @@ def get_rgb_colors(t: torch.Tensor, mta_mask: torch.Tensor, use_all: bool) -> to
 
 
 def visualize_features_per_image(
+    layer_idx: int,
     output_dict: Dict[str, torch.Tensor],
     mta_mask: torch.Tensor = None,
     use_all: bool = False,
@@ -112,7 +164,7 @@ def visualize_features_per_image(
         for image_idx, image_features in enumerate(rgb_features[:num_visualized_images]):
             axs[image_idx].imshow(image_features.numpy(force=True))
             axs[image_idx].axis("off")
-        fig.suptitle(metric_name)
+        fig.suptitle(f"Layer {layer_idx}: {metric_name}")
         
         if mta_mask is not None:
             for image_idx, h_idx, w_idx in torch.argwhere(mta_mask[:num_visualized_images]):
@@ -159,7 +211,7 @@ def visualize_qk_projection_per_image(
         qk = qk_intersection(Qw, Kw, Qb, Kb)
     else:
         qk = qk_intersection(Qw, Kw)
-
+        
     projection_variance = einops.rearrange(
         aggregate_func(qk_projection_variance(layer_output, qk, p)),
         "bsz (h w) -> bsz h w", h=H, w=W
@@ -179,28 +231,32 @@ def visualize_feature_norms_per_image(metric_name: str, t: torch.Tensor, **kwarg
 def visualize_pc_projection_per_image(
     metric_name: str,
     t: torch.Tensor,
-    modes: List[Tuple[Literal["linear", "ncut"], int]] = [("linear", 0)],
+    modes: List[Tuple[Literal["linear", "ncut", "ncut_pca"], int]] = [("linear", 0)],
     with_hist: bool = False,
     **kwargs: Any
 ) -> None:
     original_features = get_image_tokens(t)
     
-    num_eig = 100
-    ncut = NCUT(num_eig=num_eig, distance="rbf", indirect_connection=False, device=OUTPUT_DEVICE)
-    ncut_features = ncut.fit_transform(original_features.flatten(0, -2))[0].unflatten(0, original_features.shape[:-1])
+    feature_mean = torch.mean(original_features.flatten(0, -2), dim=0)
+    demeaned_features = original_features - feature_mean
+    V = torch.linalg.svd(demeaned_features.flatten(0, -2), full_matrices=False)[-1].mT
+    original_feature_projections = demeaned_features @ V
     
-    feature_dict = {
-        "linear": original_features,
-        "ncut": ncut_features,
+    ncut = generate_NCUT()
+    ncut_feature_projections = ncut.fit_transform(original_features.flatten(0, -2).to(DEVICE))[0].unflatten(0, original_features.shape[:-1]).to(OUTPUT_DEVICE)
+    
+    ncut_V = torch.linalg.svd(ncut_feature_projections.flatten(0, -2), full_matrices=False)[-1].mT
+    ncut_pca_feature_projections = ncut_feature_projections @ ncut_V
+    
+    projection_dict = {
+        "linear": original_feature_projections,
+        "ncut": ncut_feature_projections,
+        "ncut_pca": ncut_pca_feature_projections,
     }
     
     def plot_pc(mode: str, eig_idx: int) -> None:
-        features = feature_dict[mode]
-        feature_mean = torch.mean(features.flatten(0, -2), dim=0)
-        demeaned_features = features - feature_mean
-        V = torch.linalg.svd(demeaned_features.flatten(0, -2), full_matrices=False)[-1].mT[:, eig_idx]
         feature_projections = einops.rearrange(
-            demeaned_features @ V,
+            projection_dict[mode][..., eig_idx],
             "bsz (h w) -> bsz h w", h=H, w=W
         )
         _visualize_cmap_with_values(feature_projections, f"{metric_name}_{mode}_pc{eig_idx}_projection", **kwargs)
@@ -297,8 +353,8 @@ def visualize_feature_values_by_pca(
     output_dict: Dict[str, torch.Tensor],
     mta_mask: torch.Tensor,
     rgb_assignment: torch.Tensor,
-    mean: Literal[None, "local", "global"],
     ndim: int = 2,
+    with_cls: bool = True,
     with_ma: bool = True,
     highlight: torch.Tensor = None,
     convex_hull: bool = True,
@@ -312,62 +368,46 @@ def visualize_feature_values_by_pca(
     if include is None:
         include = output_dict.keys()
         
-    fig, axs = plt.subplots(nrows=1, ncols=2 * len(include), figsize=(4 * len(include), 2), subplot_kw={"projection": f"{ndim}d"} if ndim != 2 else None)
+    fig, axs = plt.subplots(nrows=1, ncols=3 * len(include), figsize=(3 * 4 * len(include), 3), subplot_kw={"projection": f"{ndim}d"} if ndim != 2 else None)
     for i, metric_name in enumerate(include):
         original_feature_values = output_dict[metric_name][:, :N + 1]
+        bsz = original_feature_values.shape[0]
         
-        # if feature_values.shape[-2] == N + 1 or torch.any(torch.isnan(feature_values)):
-        #     mask = torch.full(feature_values.shape[:2], False)
-        #     mask[:, 1:N + 1] = mta_mask.flatten(1, 2)
-        # else:
-        #     mask = torch.full(feature_values.shape[:-1], False)
-        #     mask[:, N + 1:] = True
-        # valid_mask = ~torch.any(torch.isnan(feature_values), dim=-1)
-        # inverse_mask = valid_mask & ~mask
-        
-        mask = Fn.pad(mta_mask.flatten(1, 2), (1, 0), mode="constant", value=False)
-        
-        num_eig = 100
-        ncut = NCUT(num_eig=num_eig, distance="rbf", indirect_connection=False, device=OUTPUT_DEVICE)
-        ncut_feature_values = ncut.fit_transform(original_feature_values.flatten(0, -2))[0].unflatten(0, original_feature_values.shape[:-1])
-        
-        def plot_pca(ax, feature_values: torch.Tensor, title: str) -> None:
-            bsz, _, D = feature_values.shape
-            
-            def svd(t: torch.Tensor, center: bool) -> torch.Tensor:
-                mean = torch.mean(t.flatten(0, -2), dim=0) if center else 0.0
-                return torch.linalg.svd(t - mean, full_matrices=False)
-            
-            # global_feature_mean = 0 if mean is None else torch.mean(feature_values[inverse_mask], dim=0)
-            global_feature_mean = 0 if mean is None else torch.mean(feature_values.flatten(0, -2), dim=0)
-            demeaned_feature_values = feature_values - global_feature_mean
+        demeaned_feature_values = demean(original_feature_values)
 
-            ax_names = ("x", "y", "z")
-            # if with_ma:
-            if False:
-                V_mta = svd(demeaned_feature_values[mask], center=(mean == "local"))[-1].mT[:, :1]
-                proj = torch.eye(D) - V_mta @ torch.linalg.pinv(V_mta)
-                V_nonmta = svd(demeaned_feature_values[~mask] @ proj, center=(mean == "local"))[-1].mT[:, :ndim - 1]
-                V = torch.cat((V_mta, V_nonmta), dim=-1)
-                getattr(ax, f"set_{ax_names[0]}label")("ma_direction")
-                for i in range(ndim - 1):
-                    getattr(ax, f"set_{ax_names[i + 1]}label")(f"non_ma_direction{i}")
-            else:
-                V = svd(get_image_tokens(demeaned_feature_values).flatten(0, -2), center=(mean == "local"))[-1].mT[:, :ndim]
-                for i in range(ndim):
-                    getattr(ax, f"set_{ax_names[i]}label")(f"non_ma_direction{i}")
-                    
-            compressed_features = demeaned_feature_values @ V
+        V = torch.linalg.svd(get_image_tokens(demeaned_feature_values).flatten(0, -2))[-1].mT    
+        original_compressed_features = demeaned_feature_values @ V
+        
+        if mta_mask is not None:
+            mask = Fn.pad(mta_mask.flatten(1, 2), (1, 0), mode="constant", value=False)
+        else:
+            mask = torch.full((bsz, N + 1), False)
+        
+        ncut = generate_NCUT()
+        ncut.fit(original_feature_values[:, 1:].flatten(0, -2).to(DEVICE))
+        ncut_compressed_features = ncut.transform(original_feature_values.flatten(0, -2).to(DEVICE))[0].unflatten(0, original_feature_values.shape[:-1])[..., 1:].to(OUTPUT_DEVICE)
+        # ncut_compressed_features = ncut.fit_transform(original_feature_values.flatten(0, -2))[0].unflatten(0, original_feature_values.shape[:-1])[..., 1:]
+        
+        demeaned_ncut_feature_values = demean(ncut_compressed_features)
+        ncut_V = torch.linalg.svd(demeaned_ncut_feature_values.flatten(0, -2), full_matrices=False)[-1].mT
+        ncut_pca_compressed_features = demeaned_ncut_feature_values @ ncut_V
+        
+        ax_names = ("x", "y", "z")
+        def plot_pca(ax, compressed_features: torch.Tensor, title: str) -> None:
+            compressed_features = compressed_features[..., :ndim]
             
             def to_rgb_mask(m: torch.Tensor) -> torch.Tensor:
                 return m[:, 1:N + 1].view(bsz, H, W)
             
             subsample_mask = ~mask & (1 <= torch.arange(N + 1)) & (torch.rand(mask.shape) < subsample)
+            ax.scatter(*compressed_features[subsample_mask].mT.numpy(force=True), color=rgb_assignment[to_rgb_mask(subsample_mask)].numpy(force=True), s=1, **kwargs)
+            if with_cls:
+                ax.scatter(*compressed_features[:, 0].mT.numpy(force=True), s=30, color="black", label="cls_token")
             if with_ma:
                 ax.scatter(*compressed_features[mask].mT.numpy(force=True), color=rgb_assignment[to_rgb_mask(mask)].numpy(force=True), s=10, **kwargs)
-            ax.scatter(*compressed_features[subsample_mask].mT.numpy(force=True), color=rgb_assignment[to_rgb_mask(subsample_mask)].numpy(force=True), s=1, **kwargs)
-            # ax.scatter(*compressed_features[:, 0].mT.numpy(force=True), s=30, color="black", label="cls_token")
-            
+            for i in range(ndim):
+                getattr(ax, f"set_{ax_names[i]}label")(f"projection_direction{i}")
+                    
             if highlight is not None:
                 image_idx, h_idx, w_idx = torch.unbind(highlight, dim=-1)
                 highlight_mask = torch.full_like(mask, False)
@@ -393,8 +433,9 @@ def visualize_feature_values_by_pca(
             ax.set_title(title)
             ax.legend()
         
-        plot_pca(axs[2 * i], original_feature_values, f"{metric_name}_pca_values")
-        plot_pca(axs[2 * i + 1], ncut_feature_values, f"{metric_name}_ncut_pca_values")
+        plot_pca(axs[3 * i], original_compressed_features, f"{metric_name}_pca")
+        plot_pca(axs[3 * i + 1], ncut_compressed_features, f"{metric_name}_ncut")
+        plot_pca(axs[3 * i + 2], ncut_pca_compressed_features, f"{metric_name}_ncut_pca")
 
     plt.show()
 
