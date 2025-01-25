@@ -109,9 +109,9 @@ def shift_channels(images_: torch.Tensor) -> torch.Tensor:
     return einops.rearrange(images_, "bsz c h w -> bsz h w c")
 
 
-def massive_token_heuristic(stacked_layer_output_dict: OrderedDict[str, torch.Tensor]) -> torch.Tensor:
+def massive_token_heuristic(layer_idx: int, per_metric_output_dict: OrderedDict[str, torch.Tensor]) -> torch.Tensor:
     log_norms = einops.rearrange(
-        torch.norm(stacked_layer_output_dict["layer_output"][15, :, ImageFeatures.image_indices, :], p=2, dim=-1).log(),
+        torch.norm(per_metric_output_dict["layer_output"][15][0][:, ImageFeatures.image_indices, :], p=2, dim=-1).log(),
         "bsz (h w) -> bsz h w", h=ImageFeatures.H, w=ImageFeatures.W,
     )
     flattened_norms = torch.sort(torch.flatten(log_norms), dim=0).values
@@ -188,8 +188,8 @@ def visualize_qk_projection_per_image(
 
     layer_output = features.get(layer_idx=layer_idx, key="attention_input", include=(ImageFeatures.IMAGE,)).to(DEVICE)  # [(bsz h w) x d]
 
-    QKVw = model_dict[layer_idx]["QKVw"]
-    QKVb = model_dict[layer_idx]["QKVb"]
+    QKVw = model_dict[layer_idx]["QKVw"].to(DEVICE)
+    QKVb = model_dict[layer_idx]["QKVb"].to(DEVICE)
     
     head_dim = 64
     D = layer_output.shape[-1]
@@ -203,7 +203,7 @@ def visualize_qk_projection_per_image(
         qk = qk_intersection(Qw, Kw, Qb, Kb)
     else:
         qk = qk_intersection(Qw, Kw)
-        
+    
     projection_variance = einops.rearrange(
         aggregate_func(qk_projection_variance(layer_output, qk, p)),
         "(bsz h w) -> bsz h w", h=ImageFeatures.H, w=ImageFeatures.W,

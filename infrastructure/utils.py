@@ -379,6 +379,17 @@ class print_disabled:
         sys.stdout.close()
         sys.stdout = self._original_stdout
 
+class default_device:
+    def __init__(self, device):
+        self._device = device
+    
+    def __enter__(self):
+        self._original_device = torch.get_default_device()
+        torch.set_default_device(self._device)
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        torch.set_default_device(self._original_device)
+
 def flatten_nested_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     result = {}
     def _flatten_nested_dict(s: Tuple[str, ...], d: Dict[str, Any]) -> None:

@@ -34,14 +34,14 @@ def qk_intersection(
 
 
 def qk_projection_variance(
-    X: torch.Tensor,            # [bsz x N x embed_dim]
+    X: torch.Tensor,            # [... x N x embed_dim]
     qk: torch.Tensor,           # [n_heads x embed_dim x d?]
     p: float,
 ):
-    X = X[:, None, :, :]                                # [bsz x 1 x N x embed_dim]
+    X = X[..., None, :, :]                              # [... x 1 x N x embed_dim]
     proj = qk @ torch.linalg.pinv(qk)                   # [n_heads x embed_dim x embed_dim]
-    X_proj = X @ proj[None, :, :, :]                    # [bsz x n_heads x N x embed_dim]
-    return (torch.norm(X_proj, p=2, dim=-1) ** 2) / (torch.norm(X, p=2, dim=-1) ** p)   # [bsz x n_heads x N]
+    X_proj = X @ proj                                   # [... x n_heads x N x embed_dim]
+    return (torch.norm(X_proj, p=2, dim=-1) ** 2) / (torch.norm(X, p=2, dim=-1) ** p)   # [... x n_heads x N]
     
     
 if __name__ == "__main__":
