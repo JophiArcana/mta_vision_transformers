@@ -125,6 +125,15 @@ def mask_dataset_with_total_sequence_length(ds: TensorDict[str, torch.Tensor], t
     ).mT.expand(ds.shape)
     return ds
 
+def linear_from_wb(weight: torch.Tensor, bias: torch.Tensor) -> nn.Linear:
+    if bias is None:
+        l = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+    else:
+        l = nn.Linear(weight.shape[1], weight.shape[0], bias=True)
+        l.bias.data = bias
+    l.weight.data = weight
+    return l
+
 
 """
 Computation

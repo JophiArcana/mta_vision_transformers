@@ -2,6 +2,7 @@ import types
 from typing import Callable, Dict, Literal, Optional, Tuple
 
 import einops
+import numpy as np
 import open_clip
 import torch
 import torch.nn as nn
@@ -10,19 +11,19 @@ import torch.nn.functional as F
 from infrastructure.settings import SEED, DEVICE
 
 
+
+ModeOptions = Literal["default", "concatenation", "mean_substitution", "permutation"]
 class OpenCLIPViT(nn.Module):
     def __init__(
         self,
         cutoff: Dict[str, Dict[str, Callable[[torch.Tensor], torch.Tensor]]],
-        mode: Literal["concatenation", "mean_substitution", "permutation"] = "concatenate",
+        mode: ModeOptions = "concatenate",
     ):
         super().__init__()
         model, _, _ = open_clip.create_model_and_transforms("ViT-L-14", pretrained="openai", force_quick_gelu=True)
         
         mta_masks = {}
-        def new_transformer_forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-            torch.manual_seed(SEED)
-            
+        def new_transformer_forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):            
             bsz, _, D = x.shape
             N = 256
             H = W = int(N ** 0.5)
@@ -45,6 +46,9 @@ class OpenCLIPViT(nn.Module):
                     x = r(x, attn_mask=attn_mask)
                 
                 if idx in cutoff:
+                    torch.manual_seed(SEED)
+                    np.random.seed(SEED)
+                    
                     cutoff_dict = cutoff[idx]
                     projection_condition = cutoff_dict["condition"]
 

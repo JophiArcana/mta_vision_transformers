@@ -1,14 +1,15 @@
 import collections
 import itertools
 import operator
-from typing import List, OrderedDict, Sequence, Union
+from typing import List, OrderedDict, Sequence, Tuple, Union
 
 import einops
-import tensordict
 import torch
+import torch.nn.functional as Fn
 from tensordict import TensorDict
 
 from infrastructure import utils
+from model.openclip_vit import ModeOptions
 
 
 class ImageFeatures(object):
@@ -27,13 +28,30 @@ class ImageFeatures(object):
     def process_key(cls, key: int):
         return f"layer{key}"
 
+    @classmethod
+    def from_tensor(
+        cls,
+        t: torch.Tensor,                            # [B x ~N x ?]
+        mta_masks: OrderedDict[int, torch.Tensor],  # K x [B x H x W]
+        mode: ModeOptions,
+        output_device: str,
+    ) -> "ImageFeatures":
+        return ImageFeatures(
+            [TensorDict({"": t}, batch_size=t.shape[:2])],
+            mta_masks, mode, output_device,
+        )
+
     def __init__(
         self,
         per_layer_features: List[TensorDict],       # L x [B x ~N x ?]
         mta_masks: OrderedDict[int, torch.Tensor],  # K x [B x H x W]
+        mode: ModeOptions,
+        output_device: str,
     ):
+        self.mode = mode
         self.num_layers = len(per_layer_features)
         self.device = (*mta_masks.values(),)[0].device
+        self.output_device = output_device
         
         with utils.default_device(self.device):
             mta_lengths: List[int] = [
@@ -43,14 +61,22 @@ class ImageFeatures(object):
             mta_cutoffs: List[int] = [*itertools.accumulate((ImageFeatures.N + 1, *mta_lengths), operator.add)]
 
             # Stack per-layer features by padding to equal number of tokens with NaNs
-            token_dim = 1
-            padded_per_layer_features, d = [], max(features.shape[token_dim] for features in per_layer_features)
-            assert d == ImageFeatures.N + 1 + sum(mta_lengths)
-
-            for features in per_layer_features:
-                pad_size = [0] * (2 * token_dim + 1) + [d - features.shape[token_dim]]
-                padded_per_layer_features.append(tensordict.pad(features, pad_size, value=torch.nan))
-            self.features: TensorDict = TensorDict.maybe_dense_stack(padded_per_layer_features, dim=0)      # [L x B x ~N x ?]
+            padded_per_layer_features = [TensorDict() for _ in range(self.num_layers)]
+            for k in per_layer_features[0].keys(include_nested=True, leaves_only=True):
+                per_layer_values = [features[k] for features in per_layer_features]
+                shape = torch.max(torch.stack([
+                    torch.tensor(values.shape)
+                    for values in per_layer_values
+                ], dim=0), dim=0).values
+                
+                for padded_features, values in zip(padded_per_layer_features, per_layer_values):
+                    pad_size = (*itertools.chain(*(
+                        (0, shape[i] - values.shape[i])
+                        for i in reversed(range(len(shape)))
+                    )),)
+                    padded_features[k] = Fn.pad(values, pad_size, mode="constant", value=torch.nan)
+            self.features: TensorDict = TensorDict.maybe_dense_stack(padded_per_layer_features, dim=0)
+            self.features = self.features.auto_batch_size_(batch_dims=3)    # [L x B x ~N x ?]
             self.shape = self.features.shape[:3]                                                            # (L, B, ~N)
 
             # Construct mask dict
@@ -58,7 +84,7 @@ class ImageFeatures(object):
                 (ImageFeatures.ALL, torch.tensor(True)),                                                    # []
                 (ImageFeatures.VALID, TensorDict.apply(
                     TensorDict.isfinite(self.features),                                                     # [L x B x ~N x ?]
-                    lambda t: torch.all(t, dim=-1),
+                    lambda t: torch.all(t.flatten(3, -1), dim=-1),
                 ))                                                                                          # [L x B x ~N]
             ])
 
@@ -76,18 +102,24 @@ class ImageFeatures(object):
             for (start, end), (layer_idx, mta_mask) in zip(itertools.pairwise(mta_cutoffs), mta_masks.items()):
                 mask = torch.full(self.shape, False)                                                        # [L x B x ~N]
 
-                mask[:layer_idx + 1, :, ImageFeatures.image_indices] = einops.rearrange(mta_mask, "b h w -> b (h w)")
-                mask[layer_idx + 1:, :, start:end] = (torch.arange(end - start) < torch.sum(mta_mask, dim=(1, 2))[:, None])
+                if self.mode in ["concatenation"]:
+                    mask[:layer_idx + 1, :, ImageFeatures.image_indices] = einops.rearrange(mta_mask, "b h w -> b (h w)")
+                    mask[layer_idx + 1:, :, start:end] = (torch.arange(end - start) < torch.sum(mta_mask, dim=(1, 2))[:, None])
+                elif self.mode in ["default", "mean_substitution", "permutation"]:
+                    mask[:, :, ImageFeatures.image_indices] = einops.rearrange(mta_mask, "b h w -> b (h w)")
+                
                 self.masks[ImageFeatures.process_key(layer_idx)] = mask
 
-            # Expand tensor masks to tensordicts
-            for k, mask in self.masks.items():
-                if isinstance(mask, torch.Tensor):
-                    self.masks[k] = self._expand_mask_to_tensordict(mask)
+    def update(self, key: Union[str, Tuple[str, ...]], value: Union[torch.Tensor, TensorDict]) -> None:
+        self.features[key] = value
+        self.masks[ImageFeatures.VALID][key] = torch.all(torch.isfinite(value).flatten(3, -1), dim=-1)
 
-    def _expand_mask_to_tensordict(self, mask: torch.Tensor) -> TensorDict:
-        expanded_mask = mask.expand(self.shape)
-        return TensorDict.apply(self.features, lambda _: expanded_mask)
+    def _expand_mask_to_tensordict(self, mask: Union[torch.Tensor, TensorDict]) -> TensorDict:
+        if isinstance(mask, torch.Tensor):
+            expanded_mask = mask.expand(self.shape)
+            return TensorDict.apply(self.features, lambda _: expanded_mask)
+        else:
+            return mask
 
     def _accumulate(self, queries: Sequence[str | int]) -> TensorDict:
         with utils.default_device(self.device):
@@ -95,7 +127,7 @@ class ImageFeatures(object):
             for query in queries:
                 if isinstance(query, int):
                     query = ImageFeatures.process_key(query)
-                mask = mask + self.masks.get(query, torch.tensor(False))
+                mask = mask + self._expand_mask_to_tensordict(self.masks.get(query, torch.tensor(False)))
             return mask
 
     def get(
@@ -104,6 +136,7 @@ class ImageFeatures(object):
         key: str = None,
         include: Sequence[str | int] = (ALL,),
         exclude: Sequence[str | int] = (),
+        with_batch: bool = False,
         require_valid: bool = True,
     ) -> Union[torch.Tensor, OrderedDict[str, torch.Tensor]]:
         with utils.default_device(self.device):
@@ -120,16 +153,28 @@ class ImageFeatures(object):
                 keys = (key,)
 
             if layer_idx is None:
+                if with_batch:
+                    pattern, dims = "(l bsz t) ... -> l bsz t ...", {"l": self.num_layers, "bsz": self.shape[1]}
+                else:
+                    pattern, dims = "(l t) ... -> l t ...", {"l": self.num_layers}
+                
                 result = collections.OrderedDict([
                     (k, einops.rearrange(
                         self.features[k][mask[k].expand(self.shape)],
-                        "(l t) d -> l t d", l=self.num_layers
-                    )) for k in keys
+                        pattern, **dims,
+                    ).to(self.output_device)) for k in keys
                 ])
             else:
+                if with_batch:
+                    pattern, dims = "(bsz t) ... -> bsz t ...", {"bsz": self.shape[1]}
+                else:
+                    pattern, dims = "t ... -> t ...", {}
+                
                 result = collections.OrderedDict([
-                    (k, self.features[k][layer_idx, mask[k].expand(self.shape)[layer_idx]])
-                    for k in keys
+                    (k, einops.rearrange(
+                        self.features[k][layer_idx, mask[k].expand(self.shape)[layer_idx]],
+                        pattern, **dims,
+                    ).to(self.output_device)) for k in keys
                 ])
 
             if key is None:
