@@ -15,15 +15,17 @@ from matplotlib.figure import Figure
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from nystrom_ncut import NCut, SampleConfig, AxisAlign
 from sklearn.base import TransformerMixin
+from tensordict import TensorDict
 from torch.utils._pytree import tree_flatten
 from torch_pca import PCA
 
 from core.qk import qk_intersection, qk_projection_variance
 from infrastructure import utils
 from infrastructure.settings import DEVICE, OUTPUT_DEVICE, SEED
-from model.image_features import ImageFeatures
+from modeling.image_features import ImageFeatures
 
-num_visualized_images = 6
+num_visualized_images = 4
+s: float = 5.0
 DEFAULT_LAYER_INDICES = [*range(9, 12)]
 
 new = True
@@ -34,6 +36,13 @@ num_sample = 20000
 def reset_seed():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
+
+
+def construct_per_layer_output_dict(_per_metric_output_dict: Dict[str, np.ndarray[torch.Tensor]]) -> List[TensorDict]:
+    return [
+        TensorDict(dict(zip(_per_metric_output_dict.keys(), next(zip(*v))))).auto_device_().auto_batch_size_()
+        for v in zip(*_per_metric_output_dict.values())
+    ]
 
 
 class ComposeDecomposition(TransformerMixin):
@@ -95,10 +104,10 @@ def supply_decompositions(modes: Set[DecompositionOptions]) -> Dict[str, Transfo
                 AxisAlign(sort_method=k),
             ]) for k in ("count", "norm", "marginal_norm",)
         },
-        # "ncut_pca": ComposeDecomposition([
-        #     generate_NCUT(),
-        #     PCA(n_components=n_components),
-        # ]),
+        "ncut_pca": ComposeDecomposition([
+            generate_NCUT(),
+            PCA(n_components=n_components),
+        ]),
     }
     return {k: v for k, v in result.items() if k in modes}
 
@@ -128,6 +137,11 @@ def visualize_images_with_mta(
     original_images: torch.Tensor,
     mta_mask: torch.Tensor = None,
 ) -> None:
+    mta_mask = einops.rearrange(
+        mta_mask[:, ImageFeatures.image_indices],
+        "b (h w) -> b h w", h=ImageFeatures.H, w=ImageFeatures.W,
+    )
+    
     fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(2 * num_visualized_images, 2))
     for image_idx, original_image in enumerate(shift_channels(original_images[:num_visualized_images])):
         if mta_mask is not None:
@@ -144,17 +158,6 @@ def visualize_images_with_mta(
 
 def shift_channels(images_: torch.Tensor) -> torch.Tensor:
     return einops.rearrange(images_, "bsz c h w -> bsz h w c")
-
-
-def massive_token_heuristic(layer_idx: int, per_metric_output_dict: OrderedDict[str, torch.Tensor]) -> torch.Tensor:
-    log_norms = einops.rearrange(
-        torch.norm(per_metric_output_dict["layer_output"][15][0][:, ImageFeatures.image_indices, :], p=2, dim=-1).log(),
-        "bsz (h w) -> bsz h w", h=ImageFeatures.H, w=ImageFeatures.W,
-    )
-    flattened_norms = torch.sort(torch.flatten(log_norms), dim=0).values
-    cutoff = torch.argmax(torch.diff(flattened_norms, dim=0), dim=0)
-    mask = log_norms > flattened_norms[cutoff]
-    return mask
 
 
 def get_rgb_colors(features: ImageFeatures, layer_idx: int, key: str, use_all: bool) -> torch.Tensor:
@@ -185,7 +188,7 @@ def visualize_features_per_image(
 ) -> None:
     rgb_features = get_rgb_colors(features, layer_idx=layer_idx, key=metric_name, use_all=use_all)   # [B x H x W x 3]
 
-    fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(4 * num_visualized_images, 4))
+    fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(s * num_visualized_images, s))
     for image_idx, image_features in enumerate(rgb_features[:num_visualized_images]):
         axs[image_idx].imshow(image_features.numpy(force=True))
         axs[image_idx].axis("off")
@@ -199,7 +202,10 @@ def visualize_features_per_image(
         )
 
     if mta_mask is not None:
-        for image_idx, h_idx, w_idx in torch.argwhere(mta_mask[:num_visualized_images]):
+        for image_idx, h_idx, w_idx in torch.argwhere(einops.rearrange(
+            mta_mask[:num_visualized_images, ImageFeatures.image_indices],
+            "b (h w) -> b h w", h=ImageFeatures.H, w=ImageFeatures.W,
+        )):
             draw_square(image_idx, h_idx, w_idx, "black")
     if highlight is not None:
         for image_idx, h_idx, w_idx in highlight:
@@ -242,6 +248,50 @@ def visualize_qk_projection_per_image(
     )
     _visualize_cmap_with_values(projection_variance, f"Layer {layer_idx}: qk_projection_{aggregate_name}_variance", cmap="gray")
     plt.show()
+
+
+def visualize_qk_projection_per_image2(
+    features: ImageFeatures,
+    layer_idx: int,
+    model_dict: List[Dict[str, torch.Tensor]],
+    p: float = 2.0,
+    aggregate_func: Callable[[torch.Tensor, int], torch.Tensor] = None,
+) -> None:
+    layer_output = features.get(layer_idx=layer_idx, key="attention_input", include=(ImageFeatures.IMAGE,)) # [(bsz h w) x d]
+
+    QKVw = model_dict[layer_idx]["QKVw"].to(DEVICE)
+    QKVb = model_dict[layer_idx]["QKVb"].to(DEVICE)
+    
+    head_dim = 64
+    D = layer_output.shape[-1]
+    Qw = QKVw[:D].reshape(-1, head_dim, D)
+    Kw = QKVw[D:2 * D].reshape(-1, head_dim, D)
+
+    Qb = QKVb[:D].reshape(-1, head_dim)
+    Kb = QKVb[D:2 * D].reshape(-1, head_dim)
+    
+    print(Qw.shape, Qb.shape, Kw.shape, Kb.shape)
+    raise Exception()
+    
+    
+    qk = qk_intersection(Qw, Kw, Qb, Kb)
+    if aggregate_func is not None:
+        projection_variance = tree_flatten(aggregate_func(qk_projection_variance(layer_output, qk, p, joint=False), dim=-2))[0][0]
+        aggregate_name = aggregate_func.__name__
+    else:
+        projection_variance = qk_projection_variance(layer_output, qk, p, joint=True)
+        aggregate_name = "joint"
+
+
+
+
+
+    projection_variance = einops.rearrange(
+        projection_variance,
+        "(bsz h w) -> bsz h w", h=ImageFeatures.H, w=ImageFeatures.W,
+    )
+    _visualize_cmap_with_values(projection_variance, f"Layer {layer_idx}: qk_projection_{aggregate_name}_variance", cmap="gray")
+    plt.show()
     
 
 def visualize_feature_norms_per_image(
@@ -260,43 +310,103 @@ def visualize_feature_norms_per_image(
     return feature_norms
 
 
-ScaleOptions = Literal["linear", "log"]
+ScaleOptions = Literal["linear", "log", "arcsinh"]
 def visualize_attention_matrix_per_image(
     features: ImageFeatures,
     layer_idx: int,
     mta_aliases: Dict[int, str],
+    transform_func: Callable[[torch.Tensor], torch.Tensor] = None,
     per_head: bool = False,
     rescale_func: Callable[[torch.Tensor], torch.Tensor] = None,
-    global_cmap: bool = False,
+    global_cmap: bool = True,
     cmap_scale: ScaleOptions = "linear",
-    cutoff: float = 16.0,
+    subsample: float = 1.0,
+    spacing: float = 0.1,
     **kwargs: Any,
 ) -> None:
     # Construct the rearranged attention weights
-    bsz = features.shape[1]
-    attention_weights = features.get(layer_idx=layer_idx, key="attention_matrix", include=(ImageFeatures.CLS, ImageFeatures.IMAGE,))
-    if attention_weights.ndim < 3:
+    attention_weights = features.get(layer_idx=layer_idx, key="attention_matrix", include=(ImageFeatures.CLS, ImageFeatures.IMAGE,), with_batch=True)
+    if attention_weights.ndim < 4:
         per_head = False
-
-    if not per_head and attention_weights.ndim == 3:
-        attention_weights = torch.mean(attention_weights, dim=2)
     
-    attention_weights = einops.rearrange(
-        attention_weights,
-        "(bsz n) d ... -> bsz n d ...", bsz=bsz,
+    _visualize_attention_matrix_per_image(
+        layer_idx=layer_idx,
+        attention_weights=attention_weights,
+        name_to_mask={
+            alias: features.masks[ImageFeatures.process_key(k)][layer_idx]
+            for k, alias in mta_aliases.items()
+        },
+        transform_func=transform_func,
+        per_head=per_head,
+        rescale_func=rescale_func,
+        global_cmap=global_cmap,
+        cmap_scale=cmap_scale,
+        subsample=subsample,
+        spacing=spacing,
+        **kwargs,
     )
+
+
+def visualize_attention_matrix_per_image_with_masks(
+    layer_idx: int,
+    attention_weights: torch.Tensor,
+    name_to_mask: Dict[str, torch.Tensor],
+    transform_func: Callable[[torch.Tensor], torch.Tensor] = None,
+    per_head: bool = False,
+    rescale_func: Callable[[torch.Tensor], torch.Tensor] = None,
+    global_cmap: bool = True,
+    cmap_scale: ScaleOptions = "linear",
+    subsample: float = 1.0,
+    spacing=0.1,
+    **kwargs: Any,
+) -> None:
+    _visualize_attention_matrix_per_image(
+        layer_idx=layer_idx,
+        attention_weights=attention_weights,
+        name_to_mask=name_to_mask,
+        transform_func=transform_func,
+        per_head=per_head,
+        rescale_func=rescale_func,
+        global_cmap=global_cmap,
+        cmap_scale=cmap_scale,
+        subsample=subsample,
+        spacing=spacing,
+        **kwargs,
+    )
+
+
+def _visualize_attention_matrix_per_image(
+    layer_idx: int,
+    attention_weights: torch.Tensor,
+    name_to_mask: Dict[str, torch.Tensor],
+    transform_func: Callable[[torch.Tensor], torch.Tensor],
+    per_head: bool,
+    rescale_func: Callable[[torch.Tensor], torch.Tensor],
+    global_cmap: bool,
+    cmap_scale: ScaleOptions,
+    subsample: float,
+    spacing: float,
+    **kwargs: Any,
+) -> None:
+    # Construct the rearranged attention weights
+    bsz, N = attention_weights.shape[:2]
+
+    if not per_head:
+        attention_weights = torch.mean(attention_weights, dim=-1)
     
     # Construct token masks for each cateogory
     flattened_mta_dict: Dict[str, torch.Tensor] = {
-        # "CLS": (torch.arange(ImageFeatures.N + 1) == 0).expand((bsz, -1)),
+        "CLS": (torch.arange(N) == 0).expand((bsz, -1)),
     }
-    normal_mask = (torch.arange(ImageFeatures.N + 1) > 0).expand((bsz, -1))
-    for k, alias in mta_aliases.items():
-        flattened_mta_dict[alias] = features.masks[ImageFeatures.process_key(k)][layer_idx]
-        normal_mask = normal_mask * ~flattened_mta_dict[alias]
+    normal_mask = torch.all(torch.isfinite(attention_weights), dim=-1).to(OUTPUT_DEVICE)
+    for k, mask in name_to_mask.items():
+        if k != "exclude":
+            flattened_mta_dict[k] = normal_mask * mask
+        normal_mask = normal_mask * ~mask
+    normal_mask = normal_mask * (torch.rand((bsz, N)) < subsample)
     flattened_mta_dict["Normal"] = normal_mask
 
-    order_weights = torch.arange(ImageFeatures.N + 1).repeat((bsz, 1))    
+    order_weights = torch.arange(N).repeat((bsz, 1))    
     for k, flattened_mta_mask in enumerate(flattened_mta_dict.values(), start=-len(flattened_mta_dict)):
         order_weights[flattened_mta_mask] += (2 * ImageFeatures.N) * k
     order = torch.argsort(order_weights, dim=1, stable=True)
@@ -315,45 +425,43 @@ def visualize_attention_matrix_per_image(
     
     if rescale_func is None:
         rescale_func = lambda t: t
-    rescaled_widths = rescale_func(torch.mean(widths.to(torch.float32), dim=0))
+    rescaled_widths = rescale_func(torch.mean(widths.to(torch.float32), dim=0)) + 2 * spacing
     cumulative_rescaled_widths = (0.0, *torch.cumsum(rescaled_widths, dim=0).tolist())
-
-    cutoff = min(cumulative_rescaled_widths[-1], cutoff)
+    
+    cutoff = cumulative_rescaled_widths[-1]
     aliases = (*flattened_mta_dict.keys(),)
 
-    if global_cmap:
-        vmin = torch.min(rearranged_attention_weights[:num_visualized_images]).item()
-        vmax = torch.max(rearranged_attention_weights[:num_visualized_images]).item()
+    global_vmin = torch.min(attention_weights[:num_visualized_images]).item()
+    global_vmax = torch.max(attention_weights[:num_visualized_images]).item()
     
-    scale_dict: Dict[str, Callable[[float, float], matplotlib.colors.Normalize]] = {
-        "linear": matplotlib.colors.Normalize,
-        "log": matplotlib.colors.LogNorm,
+    scale_dict: Dict[str, Callable[[float, float], str]] = {
+        "linear": "Normalize",
+        "log": "LogNorm",
+        "arcsinh": "AsinhNorm",
     }
+    norm = getattr(matplotlib.colors, scale_dict[cmap_scale])
 
     def plot_rescaled_attention(fig: Figure, ax: Axes, attention_weights: torch.Tensor, image_idx: int) -> None:
-        if not global_cmap:
-            vmin = torch.min(attention_weights).item()
-            vmax = torch.max(attention_weights).item()
+        if transform_func is not None:
+            attention_weights = transform_func(attention_weights)
+        
+        vmin = global_vmin if global_cmap else torch.min(attention_weights).item()
+        vmax = global_vmax if global_cmap else torch.max(attention_weights).item()
 
         for i, j in itertools.product(
             range(len(flattened_mta_dict)),
             range(len(flattened_mta_dict))
         ):
-            h0, h1 = cumulative_rescaled_widths[i], cumulative_rescaled_widths[i + 1]
-            w0, w1 = cumulative_rescaled_widths[j], cumulative_rescaled_widths[j + 1]
+            h0, h1 = cumulative_rescaled_widths[i] + spacing, cumulative_rescaled_widths[i + 1] - spacing
+            w0, w1 = cumulative_rescaled_widths[j] + spacing, cumulative_rescaled_widths[j + 1] - spacing
             im = ax.imshow(
                 attention_weights[
                     cumulative_widths[image_idx, i]:cumulative_widths[image_idx, i + 1],
                     cumulative_widths[image_idx, j]:cumulative_widths[image_idx, j + 1],
                 ].numpy(force=True),
                 extent=(w0, w1, h1, h0),
-                norm=scale_dict[cmap_scale](vmin=vmin, vmax=vmax),
+                norm=norm(vmin=vmin, vmax=vmax),
                 interpolation="none", **kwargs
-            )
-            ax.plot(
-                (h0, h0, h1, h1, h0),
-                (w0, w1, w1, w0, w0),
-                color="white", linewidth=16.0 / cutoff,
             )
             
             if i == 0:
@@ -367,26 +475,102 @@ def visualize_attention_matrix_per_image(
         ax.set_ylim(top=0, bottom=cutoff)
         ax.axis("off")
 
+    if transform_func is not None:
+        suffix = f"_{transform_func.__name__}"
+    else:
+        suffix = ""
+    
     if per_head:
         for image_idx in range(num_visualized_images):
             image_attention_weights = get_attention_weights_for_image_idx(image_idx)
             
             nrows, ncols = 4, 4
-            fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(4 * ncols, 4 * nrows))
+            fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(s * ncols, s * nrows))
             for head_idx, weights in enumerate(torch.unbind(image_attention_weights, dim=-1)):
                 ax: Axes = axs[head_idx // ncols, head_idx % ncols]
                 ax.set_title(f"Head {head_idx}", pad=16.0)
                 plot_rescaled_attention(fig, ax, weights, image_idx)
-            fig.suptitle(f"Layer {layer_idx}, Image {image_idx}: attention_matrix")
+            fig.suptitle(f"Layer {layer_idx}, Image {image_idx}: attention_matrix{suffix}")
             plt.show()
     else:
-        fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(4 * num_visualized_images, 4))
+        fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(s * num_visualized_images, s))
         for image_idx in range(num_visualized_images):
             ax: Axes = axs[image_idx]
-            ax.set_title(f"Image {image_idx}")
+            ax.set_title(f"Image {image_idx}", pad=16.0)
             plot_rescaled_attention(fig, axs[image_idx], get_attention_weights_for_image_idx(image_idx), image_idx,)
-        fig.suptitle(f"Layer {layer_idx}: attention_matrix")
+        fig.suptitle(f"Layer {layer_idx}: attention_matrix{suffix}")
         plt.show()
+    plt.close()
+
+
+
+
+
+
+
+
+
+
+
+def visualize_attention_weights_from_ma_per_image(
+    features: ImageFeatures,
+    layer_idx: int,
+    mta_dict: Dict[str, torch.Tensor],
+    mta_aliases: Dict[str, str],
+    exclude_self: bool = True,
+    invert: bool = False,
+    **kwargs: Any,
+) -> None:
+    # Construct the rearranged attention weights
+    bsz = features.shape[1]
+    attention_weights = features.get(layer_idx=layer_idx, key="attention_matrix", include=(ImageFeatures.IMAGE,), with_batch=True)
+    attention_weights = torch.mean(attention_weights[:, :, ImageFeatures.image_indices, :], dim=3)
+    
+    for k, mask in mta_dict.items():
+        attention_weights_from_ma = torch.zeros((bsz, ImageFeatures.N), device=DEVICE)
+        for image_idx in range(bsz):
+            indices = torch.where(mask[image_idx].flatten().to(DEVICE))[0]
+            attention_weights_from_ma[image_idx] = torch.sum(attention_weights[image_idx, :, indices], dim=1)
+
+            if exclude_self:
+                attention_weights_from_ma[image_idx, indices] -= attention_weights[image_idx, indices, indices]
+            
+        attention_weights_from_ma = einops.rearrange(
+            attention_weights_from_ma,
+            "bsz (h w) -> bsz h w", h=ImageFeatures.H, w=ImageFeatures.W,
+        )
+        
+        if invert:
+            attention_weights_from_ma = 1 - attention_weights_from_ma
+    
+        _visualize_cmap_with_values(attention_weights_from_ma, f"Layer {layer_idx}: attention_weight_on_{mta_aliases[k]}", **kwargs)
+        plt.show()
+
+
+def visualize_incoming_attention_per_image(
+    layer_idx: int,
+    attention_weights: torch.Tensor,
+    exclude_self: bool = True,
+    invert: bool = False,
+    **kwargs: Any,
+) -> None:
+    # Construct the rearranged attention weights
+    attention_weights = torch.mean(attention_weights, dim=-1)
+    if exclude_self:
+        attention_weights[:, range(ImageFeatures.N + 1), range(ImageFeatures.N + 1)] = 0.0
+    
+    attention_weights_from_cls = einops.rearrange(
+        torch.mean(attention_weights[:, :, ImageFeatures.image_indices], dim=1),
+        # attention_weights[:, :, 0],
+        "bsz (h w) -> bsz h w", h=ImageFeatures.H, w=ImageFeatures.W,
+    )
+
+    if invert:
+        attention_weights_from_cls = 1 - attention_weights_from_cls
+
+    _visualize_cmap_with_values(attention_weights_from_cls, f"Layer {layer_idx}: incoming_attention_weight", **kwargs)
+    plt.show()
+    plt.close()
 
 
 def visualize_attention_weights_per_image(
@@ -394,11 +578,8 @@ def visualize_attention_weights_per_image(
     layer_idx: int,
     mta_dict: Dict[int, torch.Tensor],
     mta_aliases: Dict[int, str],
-    
     mode: Tuple[DecompositionOptions, int],
-    
     rgb_assignment: torch.Tensor,
-    
     per_head: bool = False,
     **kwargs: Any,
 ) -> None:
@@ -431,7 +612,7 @@ def visualize_attention_weights_per_image(
         fit_features = image_features
         
         ax_names = ("x", "y", "z")
-        fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(4 * num_visualized_images, 3), subplot_kw={"projection": f"{ndim}d"} if ndim != 2 else None)
+        fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(s * num_visualized_images, s * 0.75), subplot_kw={"projection": f"{ndim}d"} if ndim != 2 else None)
         for image_idx in range(num_visualized_images):       
             ax: Axes = axs[image_idx]
 
@@ -525,7 +706,7 @@ def visualize_pc_projection_per_image(
 
     for mode, eig_idx in modes:
         feature_projections = projections[mode][..., eig_idx]
-        _visualize_cmap_with_values(feature_projections, f"Layer {layer_idx}: {metric_name}_{mode}_pc{eig_idx}_projection", **kwargs)
+        _visualize_cmap_with_values(feature_projections, f"Layer {layer_idx}: {metric_name}_{mode}{eig_idx}_projection", **kwargs)
         plt.show()
         
         if with_hist:
@@ -579,15 +760,24 @@ def compare_pc_projection_across_layers(
     ax_hist.set_yscale("log")
     plt.show()
 
-def _visualize_cmap_with_values(t: torch.Tensor, title: str, **kwargs: Any) -> Tuple[Figure, Any]:
-    fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(4 * num_visualized_images, 4))
+def _visualize_cmap_with_values(t: torch.Tensor, title: str, global_cmap: bool = True, **kwargs: Any) -> Tuple[Figure, Any]:
+    global_vmin = torch.min(t[:num_visualized_images]).item()
+    global_vmax = torch.max(t[:num_visualized_images]).item()
     
-    vmin = torch.min(t[:num_visualized_images]).item()
-    vmax = torch.max(t[:num_visualized_images]).item()
+    fig, axs = plt.subplots(nrows=1, ncols=num_visualized_images, figsize=(s * num_visualized_images, s))
     for image_idx, image_norms in enumerate(t[:num_visualized_images]):
-        im = axs[image_idx].imshow(image_norms.numpy(force=True), vmin=vmin, vmax=vmax, **kwargs)
+        if global_cmap:
+            vmin = global_vmin
+            vmax = global_vmax
+        else:
+            vmin = torch.min(image_norms).item()
+            vmax = torch.max(image_norms).item()
+        
+        ax: Axes = axs[image_idx]
+        im = ax.imshow(image_norms.numpy(force=True), vmin=vmin, vmax=vmax, **kwargs)
         fig.colorbar(im, cax=make_axes_locatable(axs[image_idx]).append_axes("right", size="5%", pad=0.05), orientation="vertical")
-        axs[image_idx].axis("off")
+        ax.axis("off")
+        ax.set_title(f"Image {image_idx}", pad=4.0)
     
     fig.suptitle(title)
     return fig, axs
@@ -690,7 +880,7 @@ def visualize_feature_values_by_pca(
             decomposition.fit(fit_features)
 
     ax_names = ("x", "y", "z")
-    fig, axs = plt.subplots(nrows=1, ncols=len(decompositions), figsize=(4 * len(decompositions), 3), subplot_kw={"projection": f"{ndim}d"} if ndim != 2 else None)
+    fig, axs = plt.subplots(nrows=1, ncols=len(decompositions), figsize=(s * len(decompositions), s * 0.75), subplot_kw={"projection": f"{ndim}d"} if ndim != 2 else None)
     for i, (decomposition_name, decomposition) in enumerate(decompositions.items()):        
         ax: Axes = axs if len(decompositions) == 1 else axs[i]
 
