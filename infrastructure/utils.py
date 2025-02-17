@@ -19,7 +19,7 @@ from dimarray import DimArray, Dataset
 from tensordict import TensorDict
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
-from infrastructure.settings import DEVICE
+from infrastructure.settings import DEVICE, SEED
 
 
 _T = TypeVar("_T")
@@ -372,6 +372,10 @@ def hash_namespace(n: Namespace) -> str:
 """
 Miscellaneous
 """
+def reset_seed():
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
 class PTR(object):
     def __init__(self, obj: object) -> None:
         self.obj = obj
