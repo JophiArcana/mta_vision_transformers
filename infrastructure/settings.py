@@ -6,6 +6,7 @@ import torch
 
 # SEED: int = 100390212
 SEED: int = 1149496617
+# SEED: int = None
 # SEED: int = int(np.random.randint(0, np.iinfo(np.int32).max))   # 27579224
 print(f"Seed: {SEED}")
 

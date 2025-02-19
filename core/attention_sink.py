@@ -22,6 +22,8 @@ def massive_token_heuristic(layer_idx: int, per_metric_output_dict: OrderedDict[
 def mask_attention_sink(
     attention: torch.Tensor,
     masked_tokens: torch.Tensor = None,
+    max_num_tokens: int = None,
+    scale: float = 1.0,
     verbose: bool = False
 ) -> torch.Tensor:
     bsz = attention.shape[0]
@@ -82,12 +84,16 @@ def mask_attention_sink(
             print(f"Threshold: {threshold[VISUALIZED_INDICES].squeeze().tolist()}")
             
     elif method == "cls":
-        scale = 1.0
-        
         attention = attention[:, 0, :]
         attention[:, 1:] = attention[:, 1:] / scale
-        indices = torch.argmax(attention, dim=1)   # [bsz]
-        mask = Fn.one_hot(indices, num_classes=ImageFeatures.N + 1).to(torch.bool)
+        
+        
+        if max_num_tokens is None:
+            mask = (attention > attention[:, :1])
+        else:
+            values, indices = torch.topk(attention[:, 1:], k=max_num_tokens, dim=1)    # [bsz]
+            mask = torch.full((bsz, ImageFeatures.N + 1), False)
+            mask[torch.arange(bsz)[:, None], indices + 1] = (values > attention[:, :1])
         
         if verbose:
             for image_idx in VISUALIZED_INDICES:

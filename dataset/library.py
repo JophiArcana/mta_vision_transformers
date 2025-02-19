@@ -5,6 +5,7 @@ DATASETS: Dict[str, List[Tuple[str, int]]] = {
     "Common": [
         ("mrm8488/ImageNet1K-val", 1000),
         ("UCSC-VLAA/Recap-COCO-30K", None),
+        ("HuggingFaceM4/COCO", None),
         ("nateraw/pascal-voc-2012", None),
         ("johnowhitaker/imagenette2-320", 10),
         ("Multimodal-Fatima/CUB_train", 200),

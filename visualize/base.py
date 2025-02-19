@@ -16,17 +16,22 @@ from infrastructure import utils
 from infrastructure.settings import DEVICE, OUTPUT_DEVICE, SEED
 from modeling.image_features import ImageFeatures
 
-VISUALIZED_INDICES = [45, 46, 47, 48, 49]   # [*range(5)]
+VISUALIZED_INDICES = [0, 1, 2, 3, 4]    # [45, 46, 47, 48, 49]
 NUM_VISUALIZED_IMAGES = len(VISUALIZED_INDICES)
 PLOT_SCALE: float = 5.0
 
 
 
 def construct_per_layer_output_dict(_per_metric_output_dict: Dict[str, np.ndarray[torch.Tensor]]) -> List[TensorDict]:
-    return [
-        TensorDict(dict(zip(_per_metric_output_dict.keys(), next(zip(*v))))).auto_device_().auto_batch_size_()
+    NUM_LAYERS = 24
+    result: List[TensorDict] = [
+        TensorDict(dict(zip(_per_metric_output_dict.keys(), next(zip(*((None,) if _v is None else _v for _v in v)))))).auto_device_().auto_batch_size_()
         for v in zip(*_per_metric_output_dict.values())
     ]
+    for idx, td in enumerate(result):
+        if td._has_non_tensor:
+            result[idx] = None
+    return result + [None] * (NUM_LAYERS - len(result))
 
 
 def mask_to_highlight(t: torch.Tensor) -> torch.Tensor:
@@ -53,10 +58,11 @@ def visualize_images_with_mta(
     mta_mask: torch.Tensor = None,
 ) -> None:
     original_images = shift_channels(original_images)
-    mta_mask = einops.rearrange(
-        mta_mask[:, ImageFeatures.image_indices],
-        "b (h w) -> b h w", h=ImageFeatures.H, w=ImageFeatures.W,
-    )
+    if mta_mask is not None:
+        mta_mask = einops.rearrange(
+            mta_mask[:, ImageFeatures.image_indices],
+            "b (h w) -> b h w", h=ImageFeatures.H, w=ImageFeatures.W,
+        )
     
     fig, axs = plt.subplots(nrows=1, ncols=NUM_VISUALIZED_IMAGES, figsize=(PLOT_SCALE * NUM_VISUALIZED_IMAGES, PLOT_SCALE))
     for ax_idx, image_idx in enumerate(VISUALIZED_INDICES):

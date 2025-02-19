@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from infrastructure.settings import DEVICE
+from modeling.openclip_vit import OpenCLIPViT
 
 
 class ImageDataset(Dataset):
@@ -17,33 +18,26 @@ class ImageDataset(Dataset):
     
     def __init__(self,
                  dataset_name: str,
-                 transform: Callable[[ImageFile], torch.Tensor] = None,
                  split: str = "train",
                  return_original_image: bool = False
     ):
-        self.data = datasets.load_dataset(dataset_name)[split]
-        if transform is None:
-            self.transform = ImageDataset.default_transform
+        self.data = datasets.load_dataset(dataset_name, split=split, trust_remote_code=True)
+        if return_original_image:
+            self.transform_list = [ImageDataset.default_transform, OpenCLIPViT.preprocess_func]
         else:
-            self.transform = transform
-        self.return_original_image = return_original_image
+            self.transform_list = [OpenCLIPViT.preprocess_func]
 
     def __len__(self) -> int:
         return self.data.num_rows
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if self.return_original_image:
-            transform_list = [ImageDataset.default_transform, self.transform]
-        else:
-            transform_list = [self.transform]
-            0
         def add_noise(t: torch.Tensor) -> torch.Tensor:
             return t + 0.0 * torch.randn_like(t)
         flip = transforms.RandomHorizontalFlip(1.0)
 
         return tuple(
             transform(self.data[idx]["image"]).to(DEVICE)
-            for transform in transform_list
+            for transform in self.transform_list
         )
 
 

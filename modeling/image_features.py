@@ -9,7 +9,6 @@ import torch.nn.functional as Fn
 from tensordict import TensorDict
 
 from infrastructure import utils
-from modeling.openclip_vit import ModeOptions
 
 
 class ImageFeatures(object):
@@ -33,7 +32,7 @@ class ImageFeatures(object):
         cls,
         t: torch.Tensor,                            # [B x ~N x ?]
         mta_masks: OrderedDict[int, torch.Tensor],  # K x [B x H x W]
-        mode: ModeOptions,
+        mode: str,
         output_device: str,
     ) -> "ImageFeatures":
         return ImageFeatures(
@@ -45,11 +44,15 @@ class ImageFeatures(object):
         self,
         per_layer_features: List[TensorDict],       # L x [B x ~N x ?]
         mta_masks: OrderedDict[int, torch.Tensor],  # K x [B x H x W]
-        mode: ModeOptions,
+        mode: str,
         output_device: str,
     ):
+        valid_layers = [idx for idx, f in enumerate(per_layer_features) if f is not None]    
+        self.num_layers = len(valid_layers)
+        self.layer_map = OrderedDict(zip(valid_layers, range(self.num_layers)))
+        per_layer_features = [per_layer_features[idx] for idx in valid_layers]
+        
         self.mode = mode
-        self.num_layers = len(per_layer_features)
         self.device = per_layer_features[0].device
         self.output_device = output_device
         
@@ -143,6 +146,12 @@ class ImageFeatures(object):
         with_batch: bool = False,
         require_valid: bool = True,
     ) -> Union[torch.Tensor, OrderedDict[str, torch.Tensor]]:
+        if layer_idx is not None:
+            if layer_idx not in self.layer_map:
+                return None
+            else:
+                layer_idx = self.layer_map[layer_idx]
+        
         with utils.default_device(self.device):
             include_mask = self._accumulate(include)
             exclude_mask = self._accumulate(exclude)

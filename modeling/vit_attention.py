@@ -12,29 +12,29 @@ from modeling.openclip_vit import OpenCLIPViT
 
 
 
-ModeOptions = Literal[
-    "default",
-    "sink",
-    "mask",
-]
 class OpenCLIPAttentionViT(OpenCLIPViT):
+    ModeOptions = Literal[
+        "default",
+        "sink",
+        "mask",
+    ]
+    
     @classmethod
     def return_module_name(cls, handle: str) -> str:
         return f"return_{handle}"
     
     def __init__(
         self,
+        mode: ModeOptions,
         mask_layer: int,
         mask: torch.Tensor,
-        mode: ModeOptions = "default",
         cache: List[torch.Tensor] = [],
         stop_layer: int = None
     ):
         OpenCLIPViT.__init__(self)
-        
+        self.mode: OpenCLIPAttentionViT.ModeOptions = mode
         self.mask_layer: int = mask_layer
         self.mask: torch.Tensor = mask
-        self.mode: ModeOptions = mode
         self.cache: torch.Tensor = [] if cache is None else cache
         self.stop_layer: int = stop_layer
         
@@ -48,7 +48,7 @@ class OpenCLIPAttentionViT(OpenCLIPViT):
                 q_x: torch.Tensor,
                 k_x: Optional[torch.Tensor] = None, 
                 v_x: Optional[torch.Tensor] = None,
-                attn_mask: Optional[torch.Tensor] = None
+                attn_mask: Optional[torch.Tensor] = None,
             ):
                 assert k_x is None and v_x is None, "Only implemented for k_x and v_x as None"
                 mask_condition = idx >= self.mask_layer and self.mask is not None
@@ -63,12 +63,12 @@ class OpenCLIPAttentionViT(OpenCLIPViT):
                     attn_weights = attn_weights + attn_mask
                 
                 if self.mode == "mask" and mask_condition:
-                    attn_weights[mask[:, None, None, :].expand_as(attn_weights)] = -torch.inf
+                    attn_weights[self.mask[:, None, None, :].expand_as(attn_weights)] = -torch.inf
                 
                 attn_matrix = F.softmax(attn_weights, dim=-1)
                 
                 if self.mode == "sink" and mask_condition:
-                    attn_matrix[mask[:, None, None, :].expand_as(attn_matrix)] = 0.0
+                    attn_matrix[self.mask[:, None, None, :].expand_as(attn_matrix)] = 0.0
                 
                 x = einops.rearrange(torch.matmul(attn_matrix, v_x), "b h n d -> b n (h d)")
                 x = F.linear(x, _self.attn.out_proj.weight, _self.attn.out_proj.bias)
@@ -90,7 +90,7 @@ class OpenCLIPAttentionViT(OpenCLIPViT):
             if len(self.cache) > 0:
                 x = self.cache[-1].to(DEVICE)
             for idx, r in enumerate(_self.resblocks[len(self.cache):]):
-                if idx == stop_layer:
+                if idx == self.stop_layer:
                     break
                 x = r(x, attn_mask=attn_mask)  
             return x

@@ -7,28 +7,31 @@ import torch
 import torch.nn.functional as F
 from open_clip.transformer import Transformer
 
-from infrastructure.settings import SEED, DEVICE
+from infrastructure import utils
+from infrastructure.settings import DEVICE
 from modeling.image_features import ImageFeatures
 from modeling.openclip_vit import OpenCLIPViT
 
 
-ModeOptions = Literal[
-    "default",
-    "concatenation",
-    "mean_substitution",
-    "permutation",
-    "mean_concatenation",
-    "permutation_concatenation",
-]
+
 class OpenCLIPExtractionViT(OpenCLIPViT):
+    ModeOptions = Literal[
+        "default",
+        "concatenation",
+        "mean_substitution",
+        "permutation",
+        "mean_concatenation",
+        "permutation_concatenation",
+    ]
+    
     def __init__(
         self,
+        mode: ModeOptions,
         cutoff: Dict[str, Dict[str, Callable[[torch.Tensor], torch.Tensor]]],
-        mode: ModeOptions = "concatenate",
     ):
-        OpenCLIPViT.__init__(self)  
+        OpenCLIPViT.__init__(self)
+        self.mode: OpenCLIPExtractionViT.ModeOptions = mode
         self.cutoff: Dict[str, Dict[str, Callable[[torch.Tensor], torch.Tensor]]] = cutoff
-        self.mode: ModeOptions = mode  
         
         self.mta_masks: Dict[int, torch.Tensor] = {}
         def new_transformer_forward(_self: Transformer, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:            
@@ -41,8 +44,7 @@ class OpenCLIPExtractionViT(OpenCLIPViT):
             for idx, r in enumerate(_self.resblocks):
                 x = r(x, attn_mask=attn_mask)
                 if idx in self.cutoff:
-                    torch.manual_seed(SEED)
-                    np.random.seed(SEED)
+                    utils.reset_seed()
                     
                     cutoff_dict = self.cutoff[idx]
                     projection_condition = cutoff_dict["condition"]
