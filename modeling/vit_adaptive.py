@@ -23,8 +23,6 @@ class OpenCLIPAdaptiveViT(OpenCLIPViT):
     ModeOptions = Literal["sink", "mask"]
     ExtractOptions = Literal["MA", "AS"]
     
-    _cache: Dict[str, torch.Tensor] = {}
-    
     @classmethod
     def return_module_name(cls, handle: str) -> str:
         return f"return_{handle}"
@@ -54,41 +52,46 @@ class OpenCLIPAdaptiveViT(OpenCLIPViT):
         self.attention_returns: Tuple[str, ...] = ("attn_matrix",)
         self.forward_returns: Tuple[str, ...] = ("mask",)
         
-
-        # SECTION: Replace resblock.attention
-        def new_resblock_attention(
-            _self: ResidualAttentionBlock,
-            q_x: torch.Tensor,
-            k_x: Optional[torch.Tensor] = None, 
-            v_x: Optional[torch.Tensor] = None,
+        nn.MultiheadAttention.forward
+        # SECTION: Replace resblock.attn.forward
+        def new_attn_forward(
+            _self: nn.MultiheadAttention,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            key_padding_mask: Optional[torch.Tensor] = None,
+            need_weights: bool = True,
             attn_mask: Optional[torch.Tensor] = None,
-        ):
-            assert k_x is None and v_x is None, "Only implemented for k_x and v_x as None"
-            mask_condition = attn_mask is not None
+            average_attn_weights: bool = True,
+            is_causal: bool = False,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            assert key is query and value is query, "Only implemented for k_x and v_x as None"
+            mask: torch.Tensor = self._cache.get("mask", None)
+            mask_condition = mask is not None
 
-            qkv = F.linear(q_x, _self.attn.in_proj_weight, _self.attn.in_proj_bias)
-            q_x, k_x, v_x = einops.rearrange(qkv, "b n (qkv h d) -> qkv b h n d", qkv=3, h=_self.attn.num_heads)
+            qkv = F.linear(query, _self.in_proj_weight, _self.in_proj_bias)
+            query, key, value = einops.rearrange(qkv, "b n (qkv h d) -> qkv b h n d", qkv=3, h=_self.num_heads)
             
-            attn_weights = torch.matmul(q_x, k_x.mT) / (q_x.shape[-1] ** 0.5)
+            attn_weights = torch.matmul(query, key.mT) / (query.shape[-1] ** 0.5)
             if self.mode == "mask" and mask_condition:
-                attn_weights[attn_mask[:, None, None, :].expand_as(attn_weights)] = -torch.inf
+                attn_weights[mask[:, None, None, :].expand_as(attn_weights)] = -torch.inf
             
             attn_matrix = F.softmax(attn_weights, dim=-1)
             if self.mode == "sink" and mask_condition:
-                attn_matrix[attn_mask[:, None, None, :].expand_as(attn_matrix)] = 0.0
+                attn_matrix[mask[:, None, None, :].expand_as(attn_matrix)] = 0.0
             
-            x = einops.rearrange(torch.matmul(attn_matrix, v_x), "b h n d -> b n (h d)")
-            x = F.linear(x, _self.attn.out_proj.weight, _self.attn.out_proj.bias)
+            x = einops.rearrange(torch.matmul(attn_matrix, value), "b h n d -> b n (h d)")
+            x = F.linear(x, _self.out_proj.weight, _self.out_proj.bias)
                 
             for k in self.attention_returns:
                 _self.get_submodule(OpenCLIPAdaptiveViT.return_module_name(k))(locals()[k])
-            return x
+            return x,
         
-        for blk in self.model.visual.transformer.resblocks:
+        for idx, blk in enumerate(self.model.visual.transformer.resblocks):
             blk: ResidualAttentionBlock
             for handle in self.attention_returns:
-                blk.register_module(OpenCLIPAdaptiveViT.return_module_name(handle), nn.Identity())
-            blk.attention = types.MethodType(new_resblock_attention, blk)
+                blk.attn.register_module(OpenCLIPAdaptiveViT.return_module_name(handle), nn.Identity())
+            blk.attn.forward = types.MethodType(new_attn_forward, blk.attn)
 
 
         # SECTION: Replace transformer.forward
@@ -100,11 +103,11 @@ class OpenCLIPAdaptiveViT(OpenCLIPViT):
                 x = (r if idx < self.mask_layer else r.forward)(x, attn_mask=None)
                 cache.append(x)
 
-            mask: torch.Tensor = OpenCLIPAdaptiveViT._cache.get("mask", None)
+            mask: torch.Tensor = self._cache.get("mask", None)
             if mask is not None:
                 assert mask.shape[0] == bsz
             else:
-                monitor = Monitor(_self.resblocks[self.detection_layer], {
+                monitor = Monitor(_self.resblocks[self.detection_layer].get_submodule("attn"), {
                     "return_attn_matrix": [
                         ("attention_matrix", OpenCLIPAdaptiveViT._attention_matrix_hook_fn)
                     ]
@@ -113,38 +116,33 @@ class OpenCLIPAdaptiveViT(OpenCLIPViT):
                 
                 max_it: float = float("inf") if self.extract == "AS" else 1
                 max_num_tokens: int = 1 if self.extract == "AS" else None
-                scale: float = 1.0 if self.extract == "AS" else 0.4
-                    
+                scale: float = 0.4 if self.extract == "AS" else 0.3
+
                 with torch.no_grad():
                     mask = torch.full((bsz, ImageFeatures.N + 1), False)
-                    it = 1
-                    convergence = torch.full((bsz,), False)
+                    it, convergence = 1, torch.full((bsz,), False)
                 
                     original_mode = self.mode
                     self.mode = "mask"
-                    while not torch.all(convergence):
-                        if it > max_it:
-                            break
-                        
+                    while not torch.all(convergence) and it <= max_it:
                         updated_x = cache[self.reset_layer - 1]
+                        self.load_cache({"mask": mask})
                         for r in _self.resblocks[self.reset_layer:self.detection_layer + 1]:
-                            updated_x = r.forward(updated_x, attn_mask=mask)
-                        
+                            updated_x = r.forward(updated_x)
+
                         new_mask = mask_attention_sink(d["attention_matrix"].pop(), masked_tokens=mask, max_num_tokens=max_num_tokens, scale=scale)
                         mask = mask + new_mask
                 
-                        # SECTION: Check convergence
                         convergence = torch.sum(new_mask, dim=1) == 0
+                        it += 1
                         
-                        # SECTION: Cleanup
-                        del updated_x, new_mask
-                        utils.empty_cache()
                     self.mode = original_mode
                 monitor.delete()
 
+            self.load_cache({"mask": mask})
             x = cache[self.mask_layer - 1]
             for r in _self.resblocks[self.mask_layer:]:
-                x = r(x, attn_mask=mask)
+                x = r(x)
             
             for k in self.forward_returns:
                 _self.get_submodule(OpenCLIPAdaptiveViT.return_module_name(k))(locals()[k])

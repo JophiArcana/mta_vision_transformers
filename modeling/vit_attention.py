@@ -1,5 +1,5 @@
 import types
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Tuple
 
 import einops
 import torch
@@ -14,82 +14,121 @@ from modeling.openclip_vit import OpenCLIPViT
 
 class OpenCLIPAttentionViT(OpenCLIPViT):
     ModeOptions = Literal[
-        "default",
         "sink",
         "mask",
+    ]
+    MaskOptions = Literal[
+        "T -> T",
+        "X -> T",
+        "~T -> T",
+        "T -> X",
+        "T -> ~T",
+        "X -> X",
+        "X = X",
+        "T = T",
     ]
     
     @classmethod
     def return_module_name(cls, handle: str) -> str:
         return f"return_{handle}"
     
+    @classmethod
+    def process_mask(cls, mask: torch.Tensor, mask_type: MaskOptions) -> torch.Tensor:
+        match mask_type:
+            case "X -> T":
+                return mask[:, None, :]                             # [bsz x 1 x n]
+            case "T -> X":
+                return mask[:, :, None]                             # [bsz x n x 1]
+            case "T = T":
+                return torch.diag_embed(mask)                       # [bsz x n x n]
+            case "T -> T":
+                return mask[:, :, None] * mask[:, None, :]          # [bsz x n x n]
+            case "~T -> T":
+                return mask[:, None, :] * ~mask[:, :, None]         # [bsz x n x n]
+                # return mask[:, None, :] * ~torch.diag_embed(mask)   # [bsz x n x n]
+            case "T -> ~T":
+                return mask[:, :, None] * ~torch.diag_embed(mask)   # [bsz x n x n]
+            case "X -> X":
+                return torch.tensor(True)   # torch.any(mask)                              # []
+            case "X = X":
+                return torch.eye(mask.shape[1]).to(torch.bool)      # [n x n]
+            case _:
+                raise ValueError(mask_type)
+    
     def __init__(
         self,
-        mode: ModeOptions,
-        mask_layer: int,
-        mask: torch.Tensor,
-        cache: List[torch.Tensor] = [],
-        stop_layer: int = None
+        mask_config: Dict[int, Tuple[ModeOptions, MaskOptions]],
+        attn_out_proj_bias: bool = True,
+        stop_layer: int = None,
     ):
         OpenCLIPViT.__init__(self)
-        self.mode: OpenCLIPAttentionViT.ModeOptions = mode
-        self.mask_layer: int = mask_layer
-        self.mask: torch.Tensor = mask
-        self.cache: torch.Tensor = [] if cache is None else cache
+        self.mask_config: Dict[int, Tuple[OpenCLIPAttentionViT.ModeOptions, OpenCLIPAttentionViT.MaskOptions]] = mask_config.copy()
+        self.attn_out_proj_bias: bool = attn_out_proj_bias
         self.stop_layer: int = stop_layer
         
-        self.attention_returns: List[str] = ["attn_matrix",]
+        self.attention_returns: List[str] = ["attn_matrix", "unmasked_attn_matrix"]
 
 
-        # SECTION: Replace resblock.attention
-        def get_attention_func_for_layer(idx: int):
-            def attention(
-                _self: ResidualAttentionBlock,
-                q_x: torch.Tensor,
-                k_x: Optional[torch.Tensor] = None, 
-                v_x: Optional[torch.Tensor] = None,
+        # SECTION: Replace resblock.attn.forward
+        def get_attention_forward_func_for_layer(idx: int):
+            def forward(
+                _self: nn.MultiheadAttention,
+                query: torch.Tensor,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None,
+                need_weights: bool = True,
                 attn_mask: Optional[torch.Tensor] = None,
-            ):
-                assert k_x is None and v_x is None, "Only implemented for k_x and v_x as None"
-                mask_condition = idx >= self.mask_layer and self.mask is not None
-
-                attn_mask = attn_mask.to(q_x.dtype) if attn_mask is not None else None
+                average_attn_weights: bool = True,
+                is_causal: bool = False,
+            ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                assert key is query and value is query, "Only implemented for k_x and v_x as None"
+                mask: torch.Tensor = self._cache.get("mask", None)
+                mode, mask_type = self.mask_config.get(idx, (None, None))
+                mask_condition = mode is not None and mask_type is not None and mask is not None
                 
-                qkv = F.linear(q_x, _self.attn.in_proj_weight, _self.attn.in_proj_bias)
-                q_x, k_x, v_x = einops.rearrange(qkv, "b n (qkv h d) -> qkv b h n d", qkv=3, h=_self.attn.num_heads)
+                qkv = F.linear(query, _self.in_proj_weight, _self.in_proj_bias)
+                query, key, value = einops.rearrange(qkv, "bsz n (qkv h d) -> qkv bsz h n d", qkv=3, h=_self.num_heads)
+                attn_weights = torch.matmul(query, key.mT) / (query.shape[-1] ** 0.5)
                 
-                attn_weights = torch.matmul(q_x, k_x.mT) / (q_x.shape[-1] ** 0.5)
-                if attn_mask is not None:
-                    attn_weights = attn_weights + attn_mask
-                
-                if self.mode == "mask" and mask_condition:
-                    attn_weights[self.mask[:, None, None, :].expand_as(attn_weights)] = -torch.inf
+                if mask_condition:
+                    index = OpenCLIPAttentionViT.process_mask(mask, mask_type).expand_as(attn_weights[:, 0])
+                    index = index[:, None].expand_as(attn_weights)
+                else:
+                    index = None
+                    
+                if mode == "mask" and mask_condition:
+                    attn_weights[index] = -torch.inf
                 
                 attn_matrix = F.softmax(attn_weights, dim=-1)
+                unmasked_attn_matrix = attn_matrix.clone()
+                if mode == "sink" and mask_condition:
+                    attn_matrix[index] = 0.0
                 
-                if self.mode == "sink" and mask_condition:
-                    attn_matrix[self.mask[:, None, None, :].expand_as(attn_matrix)] = 0.0
-                
-                x = einops.rearrange(torch.matmul(attn_matrix, v_x), "b h n d -> b n (h d)")
-                x = F.linear(x, _self.attn.out_proj.weight, _self.attn.out_proj.bias)
+                x = einops.rearrange(torch.matmul(attn_matrix, value), "b h n d -> b n (h d)")
+                if mask_type == "X -> X" and not self.attn_out_proj_bias:
+                    x = F.linear(x, _self.out_proj.weight, None)
+                else:
+                    x = F.linear(x, _self.out_proj.weight, _self.out_proj.bias)
                     
                 for k in self.attention_returns:
                     _self.get_submodule(OpenCLIPAttentionViT.return_module_name(k))(locals()[k])
-                return x
-            return attention
+                return x,
+            return forward
         
         for idx, blk in enumerate(self.model.visual.transformer.resblocks):
             blk: ResidualAttentionBlock
             for handle in self.attention_returns:
-                blk.register_module(OpenCLIPAttentionViT.return_module_name(handle), nn.Identity())
-            blk.attention = types.MethodType(get_attention_func_for_layer(idx), blk)
+                blk.attn.register_module(OpenCLIPAttentionViT.return_module_name(handle), nn.Identity())
+            blk.attn.forward = types.MethodType(get_attention_forward_func_for_layer(idx), blk.attn)
         
         
         # SECTION: Replace transformer.forward
         def new_transformer_forward(_self: Transformer, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-            if len(self.cache) > 0:
-                x = self.cache[-1].to(DEVICE)
-            for idx, r in enumerate(_self.resblocks[len(self.cache):]):
+            cache = self._cache.get("layer_output", [])
+            if len(cache) > 0:
+                x = cache[-1].to(DEVICE)
+            for idx, r in enumerate(_self.resblocks[len(cache):], start=len(cache)):
                 if idx == self.stop_layer:
                     break
                 x = r(x, attn_mask=attn_mask)  

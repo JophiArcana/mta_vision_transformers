@@ -1,9 +1,11 @@
+import itertools
 from typing import Any, Callable, Dict, List, Literal, Set, Tuple
 
 import einops
 import matplotlib.colors
 import numpy as np
 import torch
+import torch.nn.functional as Fn
 import torchvision.transforms as transforms
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
@@ -16,22 +18,22 @@ from infrastructure import utils
 from infrastructure.settings import DEVICE, OUTPUT_DEVICE, SEED
 from modeling.image_features import ImageFeatures
 
-VISUALIZED_INDICES = [0, 1, 2, 3, 4]    # [45, 46, 47, 48, 49]
+VISUALIZED_INDICES = [0, 1, 2, 3]    # [45, 46, 47, 48, 49]
 NUM_VISUALIZED_IMAGES = len(VISUALIZED_INDICES)
 PLOT_SCALE: float = 5.0
+CMAPScaleOptions = Literal["linear", "log", "arcsinh"]
 
 
 
 def construct_per_layer_output_dict(_per_metric_output_dict: Dict[str, np.ndarray[torch.Tensor]]) -> List[TensorDict]:
-    NUM_LAYERS = 24
     result: List[TensorDict] = [
-        TensorDict(dict(zip(_per_metric_output_dict.keys(), next(zip(*((None,) if _v is None else _v for _v in v)))))).auto_device_().auto_batch_size_()
+        TensorDict(dict(zip(_per_metric_output_dict.keys(), (None if _v is None else _v[-1] for _v in v)))).auto_device_().auto_batch_size_()
         for v in zip(*_per_metric_output_dict.values())
     ]
     for idx, td in enumerate(result):
         if td._has_non_tensor:
             result[idx] = None
-    return result + [None] * (NUM_LAYERS - len(result))
+    return result + [None] * (ImageFeatures.NUM_LAYERS - len(result))
 
 
 def mask_to_highlight(t: torch.Tensor) -> torch.Tensor:
@@ -52,7 +54,11 @@ def generate_rgb_from_tsne_3d(
         from ncut_pytorch import rgb_from_tsne_3d
         return rgb_from_tsne_3d(features)[1]
 
-    
+
+def symmetrize(lo: float, hi: float) -> Tuple[float, float]:
+    return -max(abs(lo), abs(hi)), max(abs(lo), abs(hi))
+
+
 def visualize_images_with_mta(
     original_images: torch.Tensor,
     mta_mask: torch.Tensor = None,
@@ -89,12 +95,15 @@ def get_rgb_colors(features: ImageFeatures, layer_idx: int, key: str, use_all: b
     utils.reset_seed()
 
     ncut = generate_NCUT()
-    image_features = features.get(layer_idx=layer_idx, key=key, include=(ImageFeatures.IMAGE,)) # [(bsz h w) x D]
+    image_features = features.get(layer_idx=layer_idx, key=key, include=(ImageFeatures.IMAGE,)).to(OUTPUT_DEVICE) # [(bsz h w) x D]
     if use_all:
         fit_features = features.get(layer_idx=layer_idx, key=key)                               # [? x D]
-        ncut_features = ncut.fit(fit_features).transform(image_features)                        # [(bsz h w) x d]
+        ncut_features = ncut.fit(fit_features).transform(image_features)
     else:
-        ncut_features = ncut.fit_transform(image_features)                                      # [(bsz h w) x d]
+        # fit_features = features.get(layer_idx=layer_idx, key=key, include=(ImageFeatures.IMAGE,), exclude=("MA",))  # [? x D]
+        ncut_features = ncut.fit_transform(image_features).to(OUTPUT_DEVICE)
+    # print(fit_features.shape, image_features.shape)
+    # ncut_features = ncut.fit(fit_features).transform(image_features)                            # [(bsz h w) x d]
 
     rgb_colors = einops.rearrange(
         generate_rgb_from_tsne_3d(ncut_features),
@@ -146,7 +155,6 @@ def visualize_features_per_image(
     plt.close()
 
     
-
 def visualize_feature_norms_per_image(
     features: ImageFeatures,
     layer_idx: int,
@@ -155,31 +163,79 @@ def visualize_feature_norms_per_image(
     **kwargs: Any
 ) -> torch.Tensor:
     feature_norms = einops.rearrange(
-        torch.norm(features.get(layer_idx=layer_idx, key=metric_name, include=(ImageFeatures.IMAGE,)), p=p, dim=-1),
+        torch.norm(features.get(layer_idx=layer_idx, key=metric_name, include=(ImageFeatures.IMAGE,), require_valid=False), p=p, dim=-1),
         "(bsz h w) -> bsz h w", h=ImageFeatures.H, w=ImageFeatures.W,
     )
+    
     _visualize_cmap_with_values(feature_norms, f"Layer {layer_idx}: {metric_name}_norm", **kwargs)
     plt.show()
     plt.close()
     return feature_norms
 
 
-def _visualize_cmap_with_values(t: torch.Tensor, title: str, global_cmap: bool = True, **kwargs: Any) -> Tuple[Figure, Any]:
+def visualize_feature_dot_products_per_image(
+    features: ImageFeatures,
+    layer_idx: int,
+    metric_name1: str,
+    metric_name2: str,
+    normalize: bool = True,
+    **kwargs: Any
+) -> torch.Tensor:
+    feature1 = features.get(layer_idx=layer_idx, key=metric_name1, include=(ImageFeatures.IMAGE,), require_valid=False, with_batch=True)
+    feature2 = features.get(layer_idx=layer_idx, key=metric_name2, include=(ImageFeatures.IMAGE,), require_valid=False, with_batch=True)
+    if normalize:
+        feature1 = Fn.normalize(feature1, p=2, dim=-1)
+        feature2 = Fn.normalize(feature2, p=2, dim=-1)
+    
+    dot_product = einops.rearrange(
+        torch.sum(feature1 * feature2, dim=-1),
+        "bsz (h w) -> bsz h w", h=ImageFeatures.H, w=ImageFeatures.W,
+    )
+    
+    _visualize_cmap_with_values(
+        dot_product, f"Layer {layer_idx}: ({metric_name1}, {metric_name2})_dot_product",
+        symmetric_cmap=True, cmap="bwr", **kwargs
+    )
+    plt.show()
+    plt.close()
+    return dot_product
+
+
+def _visualize_cmap_with_values(
+    t: torch.Tensor,
+    title: str,
+    symmetric_cmap: bool = False,
+    global_cmap: bool = True,
+    cmap_scale: CMAPScaleOptions = "linear",
+    write_values: bool = False,
+    **kwargs: Any
+) -> Tuple[Figure, np.ndarray[Axes]]:
+    scale_dict: Dict[str, Callable[[float, float], str]] = {
+        "linear": "Normalize",
+        "log": "LogNorm",
+        "arcsinh": "AsinhNorm",
+    }
+    norm = getattr(matplotlib.colors, scale_dict[cmap_scale])
+    
     global_vmin = torch.min(t[VISUALIZED_INDICES]).item()
     global_vmax = torch.max(t[VISUALIZED_INDICES]).item()
     
     fig, axs = plt.subplots(nrows=1, ncols=NUM_VISUALIZED_IMAGES, figsize=(PLOT_SCALE * NUM_VISUALIZED_IMAGES, PLOT_SCALE))
     for ax_idx, image_idx in enumerate(VISUALIZED_INDICES):
         image_features = t[image_idx]
-        if global_cmap:
-            vmin = global_vmin
-            vmax = global_vmax
-        else:
-            vmin = torch.min(image_features).item()
-            vmax = torch.max(image_features).item()
+        vmin, vmax = (global_vmin, global_vmax) if global_cmap else (
+            torch.min(image_features).item(),
+            torch.max(image_features).item(),
+        )
+        if symmetric_cmap:
+            vmin, vmax = symmetrize(vmin, vmax)
         
         ax: Axes = axs[ax_idx]
-        im = ax.imshow(image_features.numpy(force=True), vmin=vmin, vmax=vmax, **kwargs)
+        im = ax.imshow(image_features.numpy(force=True), norm=norm(vmin=vmin, vmax=vmax), **kwargs)
+        if write_values:
+            for i, j in itertools.product(range(ImageFeatures.H), range(ImageFeatures.W)):
+                ax.text(x=j, y=i, s=f"{image_features[i, j]:.1f}", fontdict={"fontsize": 6, "ha": "center", "va": "center"})
+        
         fig.colorbar(im, cax=make_axes_locatable(ax).append_axes("right", size="5%", pad=0.05), orientation="vertical")
         ax.axis("off")
         ax.set_title(f"Image {image_idx}", pad=4.0)

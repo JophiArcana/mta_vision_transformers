@@ -33,6 +33,7 @@ def mask_attention_sink(
         masked_tokens = masked_tokens.clone()
     masked_tokens[:, 0] = True
     
+    attention = attention.clone()
     if attention.ndim == 4:
         attention = torch.mean(attention, dim=-1)                               # [bsz x n x n]
 

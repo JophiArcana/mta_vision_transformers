@@ -1,3 +1,4 @@
+import collections
 import functools
 import gc
 import hashlib
@@ -450,6 +451,10 @@ class default_device:
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         torch.set_default_device(self._original_device)
+
+def sort_dict(d: Dict[str, torch.Tensor]) -> OrderedDict[str, torch.Tensor]:
+    sorted_keys: List[str] = sorted(d.keys())
+    return collections.OrderedDict([(k, d[k]) for k in sorted_keys])
 
 def flatten_nested_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     result = {}

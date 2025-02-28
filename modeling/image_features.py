@@ -14,6 +14,7 @@ from infrastructure import utils
 class ImageFeatures(object):
     H = W = 16
     N = H * W
+    NUM_LAYERS = 24
     image_indices = [*range(1, N + 1)]
 
     ALL = "all"
