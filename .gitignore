@@ -6,5 +6,10 @@ output/
 dataset/annotations/
 dataset/coco2017_val.zip
 dataset/val2017/
+dataset/val2017.pkl
+experiments/adaptive/
+experiments/attention/
+experiments/fastnystrom/
+experiments/nystrom/
 
 

@@ -31,10 +31,6 @@ class ImageDataset(Dataset):
         return self.data.num_rows
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        def add_noise(t: torch.Tensor) -> torch.Tensor:
-            return t + 0.0 * torch.randn_like(t)
-        flip = transforms.RandomHorizontalFlip(1.0)
-
         return tuple(
             transform(self.data[idx]["image"]).to(DEVICE)
             for transform in self.transform_list

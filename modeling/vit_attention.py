@@ -20,6 +20,7 @@ class OpenCLIPAttentionViT(OpenCLIPViT):
     MaskOptions = Literal[
         "T -> T",
         "X -> T",
+        "~{T} -> T",
         "~T -> T",
         "T -> X",
         "T -> ~T",
@@ -43,9 +44,10 @@ class OpenCLIPAttentionViT(OpenCLIPViT):
                 return torch.diag_embed(mask)                       # [bsz x n x n]
             case "T -> T":
                 return mask[:, :, None] * mask[:, None, :]          # [bsz x n x n]
-            case "~T -> T":
+            case "~{T} -> T":
                 return mask[:, None, :] * ~mask[:, :, None]         # [bsz x n x n]
-                # return mask[:, None, :] * ~torch.diag_embed(mask)   # [bsz x n x n]
+            case "~T -> T":
+                return mask[:, None, :] * ~torch.diag_embed(mask)   # [bsz x n x n]
             case "T -> ~T":
                 return mask[:, :, None] * ~torch.diag_embed(mask)   # [bsz x n x n]
             case "X -> X":

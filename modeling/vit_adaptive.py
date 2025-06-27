@@ -50,7 +50,7 @@ class OpenCLIPAdaptiveViT(OpenCLIPViT):
         self.detection_layer: int = detection_layer
         
         self.attention_returns: Tuple[str, ...] = ("attn_matrix",)
-        self.forward_returns: Tuple[str, ...] = ("mask",)
+        self.forward_returns: Tuple[str, ...] = ("ranked_mask",)
         
         nn.MultiheadAttention.forward
         # SECTION: Replace resblock.attn.forward
@@ -103,9 +103,9 @@ class OpenCLIPAdaptiveViT(OpenCLIPViT):
                 x = (r if idx < self.mask_layer else r.forward)(x, attn_mask=None)
                 cache.append(x)
 
-            mask: torch.Tensor = self._cache.get("mask", None)
-            if mask is not None:
-                assert mask.shape[0] == bsz
+            ranked_mask: torch.Tensor = self._cache.get("ranked_mask", None)
+            if ranked_mask is not None:
+                assert ranked_mask.shape[0] == bsz
             else:
                 monitor = Monitor(_self.resblocks[self.detection_layer].get_submodule("attn"), {
                     "return_attn_matrix": [
@@ -116,30 +116,30 @@ class OpenCLIPAdaptiveViT(OpenCLIPViT):
                 
                 max_it: float = float("inf") if self.extract == "AS" else 1
                 max_num_tokens: int = 1 if self.extract == "AS" else None
-                scale: float = 0.4 if self.extract == "AS" else 0.3
+                scale: float = 1.0 if self.extract == "AS" else 0.3
 
                 with torch.no_grad():
-                    mask = torch.full((bsz, ImageFeatures.N + 1), False)
-                    it, convergence = 1, torch.full((bsz,), False)
+                    ranked_mask = torch.full((bsz, ImageFeatures.N + 1), torch.inf)
+                    it, convergence = 1, False
                 
                     original_mode = self.mode
                     self.mode = "mask"
-                    while not torch.all(convergence) and it <= max_it:
+                    while not convergence and it <= max_it:
                         updated_x = cache[self.reset_layer - 1]
-                        self.load_cache({"mask": mask})
+                        self.load_cache({"mask": torch.isfinite(ranked_mask)})
                         for r in _self.resblocks[self.reset_layer:self.detection_layer + 1]:
                             updated_x = r.forward(updated_x)
 
-                        new_mask = mask_attention_sink(d["attention_matrix"].pop(), masked_tokens=mask, max_num_tokens=max_num_tokens, scale=scale)
-                        mask = mask + new_mask
+                        new_mask = mask_attention_sink(d["attention_matrix"].pop(), masked_tokens=torch.isfinite(ranked_mask), max_num_tokens=max_num_tokens, scale=scale)
+                        ranked_mask[new_mask] = it
                 
-                        convergence = torch.sum(new_mask, dim=1) == 0
+                        convergence = not torch.any(new_mask).item()
                         it += 1
                         
                     self.mode = original_mode
                 monitor.delete()
 
-            self.load_cache({"mask": mask})
+            self.load_cache({"mask": torch.isfinite(ranked_mask)})
             x = cache[self.mask_layer - 1]
             for r in _self.resblocks[self.mask_layer:]:
                 x = r(x)

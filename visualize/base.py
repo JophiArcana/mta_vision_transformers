@@ -1,5 +1,5 @@
 import itertools
-from typing import Any, Callable, Dict, List, Literal, Set, Tuple
+from typing import Any, Callable, Dict, List, Literal, Set, Tuple, Union
 
 import einops
 import matplotlib.colors
@@ -18,7 +18,7 @@ from infrastructure import utils
 from infrastructure.settings import DEVICE, OUTPUT_DEVICE, SEED
 from modeling.image_features import ImageFeatures
 
-VISUALIZED_INDICES = [0, 1, 2, 3]    # [45, 46, 47, 48, 49]
+VISUALIZED_INDICES = [0, 1, 2, 3, 4, 5]    # [45, 46, 47, 48, 49]
 NUM_VISUALIZED_IMAGES = len(VISUALIZED_INDICES)
 PLOT_SCALE: float = 5.0
 CMAPScaleOptions = Literal["linear", "log", "arcsinh"]
@@ -27,7 +27,7 @@ CMAPScaleOptions = Literal["linear", "log", "arcsinh"]
 
 def construct_per_layer_output_dict(_per_metric_output_dict: Dict[str, np.ndarray[torch.Tensor]]) -> List[TensorDict]:
     result: List[TensorDict] = [
-        TensorDict(dict(zip(_per_metric_output_dict.keys(), (None if _v is None else _v[-1] for _v in v)))).auto_device_().auto_batch_size_()
+        TensorDict(dict(zip(_per_metric_output_dict.keys(), (None if _v is None else _v[-1] for _v in v)))).auto_device_().auto_batch_size_(batch_dims=2)
         for v in zip(*_per_metric_output_dict.values())
     ]
     for idx, td in enumerate(result):
@@ -95,13 +95,13 @@ def get_rgb_colors(features: ImageFeatures, layer_idx: int, key: str, use_all: b
     utils.reset_seed()
 
     ncut = generate_NCUT()
-    image_features = features.get(layer_idx=layer_idx, key=key, include=(ImageFeatures.IMAGE,)).to(OUTPUT_DEVICE) # [(bsz h w) x D]
+    image_features = features.get(layer_idx=layer_idx, key=key, include=(ImageFeatures.IMAGE,)) # [(bsz h w) x D]
     if use_all:
         fit_features = features.get(layer_idx=layer_idx, key=key)                               # [? x D]
         ncut_features = ncut.fit(fit_features).transform(image_features)
     else:
         # fit_features = features.get(layer_idx=layer_idx, key=key, include=(ImageFeatures.IMAGE,), exclude=("MA",))  # [? x D]
-        ncut_features = ncut.fit_transform(image_features).to(OUTPUT_DEVICE)
+        ncut_features = ncut.fit_transform(image_features)
     # print(fit_features.shape, image_features.shape)
     # ncut_features = ncut.fit(fit_features).transform(image_features)                            # [(bsz h w) x d]
 
@@ -156,7 +156,30 @@ def visualize_features_per_image(
 
     
 def visualize_feature_norms_per_image(
-    features: ImageFeatures,
+    features: Union[torch.Tensor, ImageFeatures],
+    layer_idx: int = None,
+    metric_name: str = None,
+    title: str = None,
+    p: float = 2.0,
+    **kwargs: Any
+) -> torch.Tensor:
+    if not torch.is_tensor(features):
+        features = features.get(layer_idx=layer_idx, key=metric_name, include=(ImageFeatures.CLS, ImageFeatures.IMAGE,), require_valid=False, with_batch=True)
+        title = f"Layer {layer_idx}: {metric_name}_norm"
+        
+    feature_norms = einops.rearrange(
+        torch.norm(features[:, ImageFeatures.image_indices], p=p, dim=-1),
+        "bsz (h w) -> bsz h w", h=ImageFeatures.H, w=ImageFeatures.W,
+    )
+    
+    _visualize_cmap_with_values(feature_norms, title, **kwargs)
+    plt.show()
+    plt.close()
+    return feature_norms
+
+
+def visualize_feature_norms_per_image_with_tensor(
+    features: torch.Tensor,
     layer_idx: int,
     metric_name: str,
     p: float = 2.0,

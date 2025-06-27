@@ -93,7 +93,8 @@ def run_retrieval_evaluation(
     model: OpenCLIPViT,
     dataset: BaseDataset = DEFAULT_DATASET,
     k_values: List[int] = [1, 5, 10],
-) -> TensorDict:
+    batch_size: int = 32,
+) -> Tuple[torch.Tensor, TensorDict]:
     """
     Compute retrieval metrics for the validation dataset.
     
@@ -129,7 +130,7 @@ def run_retrieval_evaluation(
         collated_cache: Dict[str, torch.Tensor] = default_collate(cache_list)
         return collated_data, collated_cache
     
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     embedding_lists: Dict[str, List[torch.Tensor]] = {"image": [], "text": []}
     
     with torch.no_grad():
@@ -150,19 +151,16 @@ def run_retrieval_evaluation(
     x = torch.arange(cumulative_n_captions[-1])
     mask: torch.Tensor = (cumulative_n_captions[:-1, None] <= x) * (x < cumulative_n_captions[1:, None])
 
-    return TensorDict({
-        "image_to_text": get_retrieval(similarity_matrix, mask),
-        "text_to_image": get_retrieval(similarity_matrix.mT, mask.mT),
+    return similarity_matrix, TensorDict({
+        "Image-to-Text": get_retrieval(similarity_matrix, mask),
+        "Text-to-Image": get_retrieval(similarity_matrix.mT, mask.mT),
     }, batch_size=())
 
 
 def print_retrieval_metrics(retrieval_metrics: TensorDict[str, TensorDict], indent: int = 0) -> None:
     # Print results    
     t = "\t" * indent
-    print(f"{t}Text-to-Image Retrieval Metrics:")
-    for k, value in utils.sort_dict(retrieval_metrics["text_to_image"]).items():
-        print(f"{t}{k}: {(100 * value.item()):.2f}%")
-
-    print(f"{t}Image-to-Text Retrieval Metrics:")
-    for k, value in utils.sort_dict(retrieval_metrics["image_to_text"]).items():
-        print(f"{t}{k}: {(100 * value.item()):.2f}%")
+    for retrieval_type, d in retrieval_metrics.items():
+        print(f"{t}{retrieval_type} Retrieval Metrics:")
+        for k, value in utils.sort_dict(d).items():
+            print(f"{t}{k}: {(100 * value.item()):.2f}%")

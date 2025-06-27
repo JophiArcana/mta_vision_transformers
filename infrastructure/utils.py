@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+import time
 from argparse import Namespace
 from collections import OrderedDict
 from matplotlib import transforms
@@ -374,6 +375,18 @@ def hash_namespace(n: Namespace) -> str:
 """
 Miscellaneous
 """
+class Timer:
+    _start_t: float = None
+    
+    @classmethod
+    def start(cls):
+        cls._start_t = time.perf_counter()
+    
+    @classmethod
+    def stop(cls) -> float:
+        return time.perf_counter() - cls._start_t
+    
+
 def reset_seed():
     if SEED is None:
         torch.seed()

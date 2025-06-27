@@ -226,22 +226,23 @@ def visualize_feature_values_by_pca(
             )
 
         # SECTION: Plot AS tokens
-        flattened_mta_mask = mta_mask[:, ImageFeatures.image_indices].flatten()
-        binary_mask = flattened_mta_mask > 0
+        if mta_mask is not None:
+            flattened_mta_mask = mta_mask[:, ImageFeatures.image_indices].flatten()
+            binary_mask = flattened_mta_mask > 0
+            
+            lo, hi, decay = 10, 1000, 0.7
+            if mta_mask.dtype == torch.bool:
+                size = lo
+            elif mta_mask.dtype in [torch.int, torch.long]:
+                rank = flattened_mta_mask[binary_mask]
+                size = lo + (hi - lo) * (decay ** (rank - 1))
+            else:
+                raise ValueError(mta_mask.dtype)
         
-        lo, hi, decay = 10, 1000, 0.7
-        if mta_mask.dtype == torch.bool:
-            size = lo
-        elif mta_mask.dtype in [torch.int, torch.long]:
-            rank = flattened_mta_mask[binary_mask]
-            size = lo + (hi - lo) * (decay ** (rank - 1))
-        else:
-            raise ValueError(mta_mask.dtype)
-        
-        ax.scatter(
-            *compress(image_features[binary_mask]).mT.numpy(force=True),
-            color=rgb_assignment.flatten(0, -2)[binary_mask].numpy(force=True), edgecolors="black", s=size, **kwargs
-        )
+            ax.scatter(
+                *compress(image_features[binary_mask]).mT.numpy(force=True),
+                color=rgb_assignment.flatten(0, -2)[binary_mask].numpy(force=True), edgecolors="black", s=size, **kwargs
+            )
          
         # SECTION: Plot highlighted tokens
         if highlight is not None:

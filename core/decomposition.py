@@ -1,7 +1,7 @@
 from typing import Any, Callable, Dict, List, Literal, Set, Tuple
 
 import torch
-from nystrom_ncut import NCut, SampleConfig, AxisAlign
+from nystrom_ncut import NystromNCut, KernelNCut, SampleConfig, AxisAlign
 from sklearn.base import TransformerMixin
 from torch_pca import PCA
 
@@ -38,19 +38,29 @@ class ComposeDecomposition(TransformerMixin):
 
 def generate_NCUT(distance: str = "rbf"):
     if True:
-        return NCut(
+        return KernelNCut(
             n_components=N_COMPONENTS,
-            distance=distance,
-            adaptive_scaling=True,
+            kernel_dim=10000,
+            affinity_type=distance,
             sample_config=SampleConfig(
                 method="fps",
-                # method="fps_recursive",
                 num_sample=NUM_SAMPLE,
                 fps_dim=12,
-                # n_iter=1,
             ),
-            eig_solver="svd_lowrank"
         )
+        # return NystromNCut(
+        #     n_components=N_COMPONENTS,
+        #     affinity_type=distance,
+        #     adaptive_scaling=True,
+        #     sample_config=SampleConfig(
+        #         method="fps",
+        #         # method="fps_recursive",
+        #         num_sample=NUM_SAMPLE,
+        #         fps_dim=12,
+        #         # n_iter=1,
+        #     ),
+        #     eig_solver="svd_lowrank"
+        # )
     else:
         from ncut_pytorch import NCUT
         return NCUT(num_eig=N_COMPONENTS, num_sample=NUM_SAMPLE, distance=distance)

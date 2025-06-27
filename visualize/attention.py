@@ -80,13 +80,13 @@ def visualize_attention_matrix_per_image(
         per_head = False
     if not per_head and attention_weights.ndim == 4:
         attention_weights = torch.mean(attention_weights, dim=-1)
-    compressed_attention_weights = torch.mean(attention_weights, dim=-1) if per_head else attention_weights
+    # compressed_attention_weights = torch.mean(attention_weights, dim=-1) if per_head else attention_weights
     
     # Construct token masks for each cateogory
     flattened_mta_dict: OrderedDict[str, torch.Tensor] = OrderedDict({
         "CLS": (torch.arange(N) == 0).expand((bsz, -1)),
     })
-    normal_mask = (torch.arange(N) > 0) * (torch.all(torch.isfinite(attention_weights).flatten(2, -1), dim=-1).to(OUTPUT_DEVICE))
+    normal_mask = (torch.arange(N) > 0) * (torch.all(torch.isfinite(attention_weights).flatten(2, -1), dim=-1))
     for k, mask in name_to_mask.items():
         if k != "":
             flattened_mta_dict[k] = normal_mask * mask
@@ -134,25 +134,7 @@ def visualize_attention_matrix_per_image(
         
         sub_orders: List[torch.Tensor] = []
         for i in range(len(flattened_mta_dict)):
-            if order_by_tsne:
-                utils.reset_seed()
-                sub_matrix = compressed_attention_weights[
-                    image_idx,
-                    cumulative_widths[image_idx, i]:cumulative_widths[image_idx, i + 1],
-                    cumulative_widths[image_idx, i]:cumulative_widths[image_idx, i + 1],
-                ].clone()
-                # sub_matrix.fill_diagonal_(0.0)
-                
-                if sub_matrix.shape[0] <= 5:
-                    sub_orders.append(torch.arange(widths[image_idx, i], device=DEVICE))
-                else:
-                    L, V = torch.lobpcg(sub_matrix + sub_matrix.mT, k=min(sub_matrix.shape[0], 4))
-                    compression = AxisAlign(sort_method="marginal_norm").fit_transform(V, normalize=False, hard=True)
-                    # compression = torch.svd_lowrank(sub_matrix, q=1)[0][:, 0]
-                    # sub_orders.append(torch.arange(widths[image_idx, i], device=DEVICE))
-                    sub_orders.append(torch.argsort(compression, dim=0))
-            else:
-                sub_orders.append(torch.arange(widths[image_idx, i], device=DEVICE))
+            sub_orders.append(torch.arange(widths[image_idx, i], device=DEVICE))
         
         vmin, vmax = (global_vmin, global_vmax) if global_cmap else (
             torch.min(attention_weights).item(),
@@ -170,8 +152,8 @@ def visualize_attention_matrix_per_image(
             w0, w1 = cumulative_rescaled_widths[j] + spacing, cumulative_rescaled_widths[j + 1] - spacing
             im = ax.imshow(
                 attention_weights[
-                    (cumulative_widths[image_idx, i] + sub_orders[i])[:, None],
-                    (cumulative_widths[image_idx, j] + sub_orders[j])[None, :],
+                    cumulative_widths[image_idx, i]:cumulative_widths[image_idx, i + 1],
+                    cumulative_widths[image_idx, j]:cumulative_widths[image_idx, j + 1],
                 ].numpy(force=True),
                 extent=(w0, w1, h1, h0),
                 norm=norm(vmin=vmin, vmax=vmax),
@@ -180,7 +162,12 @@ def visualize_attention_matrix_per_image(
             if i == 0:
                 ax.text(
                     (w0 + w1) / 2, -0.5, aliases[j],
-                    horizontalalignment="center", verticalalignment="center", fontsize="x-small",
+                    ha="center", va="center", fontsize="medium",
+                )
+            if j == 0:
+                ax.text(
+                    -0.5, (h0 + h1) / 2, aliases[i],
+                    ha="center", va="center", fontsize="medium", rotation="vertical",
                 )
         
         fig.colorbar(im, cax=make_axes_locatable(ax).append_axes("right", size="5%", pad=0.05), orientation="vertical")
@@ -201,19 +188,166 @@ def visualize_attention_matrix_per_image(
             fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(PLOT_SCALE * ncols, PLOT_SCALE * nrows))
             for head_idx, weights in enumerate(torch.unbind(image_attention_weights, dim=-1)):
                 ax: Axes = axs[head_idx // ncols, head_idx % ncols]
-                ax.set_title(f"Head {head_idx}", pad=16.0)
+                ax.set_title(f"Head {head_idx}", pad=24.0, fontsize="xx-large")
                 plot_rescaled_attention(fig, ax, weights, image_idx)
             fig.suptitle(f"Layer {layer_idx}, Image {image_idx}: attention_matrix{suffix}")
             plt.show()
     else:
         fig, axs = plt.subplots(nrows=1, ncols=NUM_VISUALIZED_IMAGES, figsize=(PLOT_SCALE * NUM_VISUALIZED_IMAGES, PLOT_SCALE))
         for ax_idx, image_idx in enumerate(VISUALIZED_INDICES):
-            ax: Axes = axs[ax_idx]
-            ax.set_title(f"Image {image_idx}", pad=16.0)
+            ax: Axes = axs[ax_idx] if NUM_VISUALIZED_IMAGES > 1 else axs
+            ax.set_title(f"Image {image_idx}", pad=24.0, fontsize="xx-large")
             plot_rescaled_attention(fig, ax, get_attention_weights_for_image_idx(image_idx), image_idx,)
         fig.suptitle(f"Layer {layer_idx}: attention_matrix{suffix}")
         plt.show()
     plt.close()
+
+
+
+
+
+
+
+
+
+def visualize_attention_matrix_per_layer(
+    layer_indices: List[int],
+    attention_weights: torch.Tensor,
+    name_to_mask: Dict[str, torch.Tensor],
+    transform_func: Callable[[torch.Tensor], torch.Tensor] = None,
+    rescale_func: Callable[[torch.Tensor], torch.Tensor] = None,
+    symmetric_cmap: bool = False,
+    global_cmap: bool = True,
+    cmap_scale: CMAPScaleOptions = "linear",
+    subsample: float = 1.0,
+    spacing: float = 0.1,
+    spacing_color: str = "white",
+    save_fname: str = None,
+    **kwargs: Any,
+) -> None:
+    # Construct the rearranged attention weights
+    bsz, N = attention_weights.shape[1:3]
+
+    if attention_weights.ndim == 5:
+        attention_weights = torch.mean(attention_weights, dim=-1)
+    
+    # Construct token masks for each cateogory
+    flattened_mta_dict: OrderedDict[str, torch.Tensor] = OrderedDict({
+        "CLS": (torch.arange(N) == 0).expand((bsz, -1)),
+    })
+    normal_mask = (torch.arange(N) > 0) * (torch.all(torch.isfinite(attention_weights).flatten(3, -1), dim=[0, -1]))
+    for k, mask in name_to_mask.items():
+        if k != "":
+            flattened_mta_dict[k] = normal_mask * mask
+        normal_mask = normal_mask * ~mask
+    normal_mask = normal_mask * (torch.rand((bsz, N)) < subsample)
+    flattened_mta_dict["Normal"] = normal_mask
+
+    order_weights = torch.arange(N).repeat((bsz, 1))    
+    for k, flattened_mta_mask in enumerate(flattened_mta_dict.values(), start=-len(flattened_mta_dict)):
+        order_weights[flattened_mta_mask] += (2 * ImageFeatures.N) * k
+    order = torch.argsort(order_weights, dim=1, stable=True)
+    counts = torch.sum(order_weights < 0, dim=1)
+
+    def get_attention_weights_for_image_idx(image_idx: int) -> torch.Tensor:
+        _order = order[image_idx, :counts[image_idx]]
+        return attention_weights[:, image_idx, _order[:, None], _order[None, :]]
+
+    # Compute the widths of the rescaled attention image
+    widths = torch.stack([
+        torch.sum(flattened_mta_mask, dim=1)
+        for flattened_mta_mask in flattened_mta_dict.values()
+    ], dim=1)
+    cumulative_widths = Fn.pad(torch.cumsum(widths, dim=1), (1, 0), mode="constant", value=0)
+    
+    if rescale_func is None:
+        rescale_func = lambda t: t
+    rescaled_widths = rescale_func(torch.mean(widths.to(torch.float32), dim=0).clamp_min_(1.0)) + 2 * spacing
+    cumulative_rescaled_widths = (0.0, *torch.cumsum(rescaled_widths, dim=0).tolist())
+    
+    cutoff = cumulative_rescaled_widths[-1]
+    aliases = (*flattened_mta_dict.keys(),)
+
+    scale_dict: Dict[str, Callable[[float, float], str]] = {
+        "linear": "Normalize",
+        "log": "LogNorm",
+        "arcsinh": "AsinhNorm",
+    }
+    norm = getattr(matplotlib.colors, scale_dict[cmap_scale])
+
+    def plot_rescaled_attention(fig: Figure, ax: Axes, attention_weights: torch.Tensor, image_idx: int, global_vmin: float, global_vmax: float) -> None:
+        if transform_func is not None:
+            attention_weights = transform_func(attention_weights)
+        
+        sub_orders: List[torch.Tensor] = []
+        for i in range(len(flattened_mta_dict)):
+            sub_orders.append(torch.arange(widths[image_idx, i], device=DEVICE))
+        
+        vmin, vmax = (global_vmin, global_vmax) if global_cmap else (
+            torch.min(attention_weights).item(),
+            torch.max(attention_weights).item(),
+        )
+        if symmetric_cmap:
+            vmin, vmax = symmetrize(vmin, vmax)
+
+        ax.add_patch(Rectangle((0, 0), cumulative_rescaled_widths[-1], cumulative_rescaled_widths[-1], facecolor=spacing_color, zorder=-100)) 
+        for i, j in itertools.product(
+            range(len(flattened_mta_dict)),
+            range(len(flattened_mta_dict))
+        ):
+            h0, h1 = cumulative_rescaled_widths[i] + spacing, cumulative_rescaled_widths[i + 1] - spacing
+            w0, w1 = cumulative_rescaled_widths[j] + spacing, cumulative_rescaled_widths[j + 1] - spacing
+            im = ax.imshow(
+                attention_weights[
+                    cumulative_widths[image_idx, i]:cumulative_widths[image_idx, i + 1],
+                    cumulative_widths[image_idx, j]:cumulative_widths[image_idx, j + 1],
+                ].numpy(force=True),
+                extent=(w0, w1, h1, h0),
+                norm=norm(vmin=vmin, vmax=vmax),
+                interpolation="none", **kwargs
+            )           
+            if i == 0:
+                ax.text(
+                    (w0 + w1) / 2, -0.5, aliases[j],
+                    ha="center", va="center", fontsize="large",
+                )
+            if j == 0:
+                ax.text(
+                    -0.5, (h0 + h1) / 2, aliases[i],
+                    ha="center", va="center", fontsize="large", rotation="vertical",
+                )
+        
+        fig.colorbar(im, cax=make_axes_locatable(ax).append_axes("right", size="5%", pad=0.05), orientation="vertical")
+        ax.set_xlim(left=0, right=cutoff)
+        ax.set_ylim(top=0, bottom=cutoff)
+        ax.axis("off")
+
+    # if transform_func is not None:
+    #     suffix = f"_{transform_func.__name__}"
+    # else:
+    #     suffix = ""
+    
+    for image_idx in VISUALIZED_INDICES:
+        image_attention_weights = get_attention_weights_for_image_idx(image_idx)
+        global_vmin, global_vmax = torch.min(image_attention_weights[layer_indices]).item(), torch.max(image_attention_weights[layer_indices]).item()
+        
+        fig, axs = plt.subplots(nrows=1, ncols=len(layer_indices), figsize=(PLOT_SCALE * len(layer_indices), PLOT_SCALE))
+        for ax_idx, layer_idx in enumerate(layer_indices):
+            ax: Axes = axs[ax_idx]
+            ax.set_title(f"Layer {layer_idx}", pad=24.0, fontsize="xx-large")
+            plot_rescaled_attention(fig, ax, image_attention_weights[layer_idx], image_idx, global_vmin, global_vmax)
+        fig.suptitle(
+            f"Attention Matrices from Layers {min(layer_indices)} to {max(layer_indices)}",
+            fontsize=22, y=1.02,
+        )
+        if save_fname is not None:
+            plt.savefig(f"{save_fname}_image{image_idx}.pdf", bbox_inches="tight")
+        plt.show()
+        plt.close()
+
+
+
+
 
 
 
@@ -256,11 +390,8 @@ def visualize_attention_suppression_per_image(
         subspace = Fn.normalize(subspace, p=2, dim=1)
     x = einops.rearrange(x, "(bsz n) d -> bsz n d", bsz=bsz)                                                # [bsz x n x embed_dim]
     subspace = einops.rearrange(subspace, "h d (bsz n) -> bsz h n d", bsz=bsz)                              # [bsz x n_heads x n x embed_dim]
- 
-    
-    
- 
- 
+
+
     pairwise_suppression_projection = x[:, None, :, :] @ subspace.mT                                # [bsz x n_heads x n x n]
     pairwise_suppression_projection = einops.rearrange(pairwise_suppression_projection, "bsz h n1 n2 -> bsz n1 n2 h")   # [bsz x n x n x n_heads]
     
@@ -467,11 +598,9 @@ def visualize_attention_sink_decay(
             attention_weights = attention_weights[:, :, 0, :]
         else:
             attention_weights = torch.mean(attention_weights, dim=2)
-    
-    counts = torch.count_nonzero(ranked_AS_mask, dim=1)                                                 # [bsz]
+
+    counts = torch.sum(ranked_AS_mask.isfinite(), dim=1)                                                    # [bsz]
     if lock_tokens:
-        ranked_AS_mask = ranked_AS_mask.clone()
-        ranked_AS_mask[torch.where(ranked_AS_mask == 0)] = torch.iinfo(torch.int32).max
         indices = torch.topk(ranked_AS_mask, k=k, dim=1, largest=False).indices
         topk_values = attention_weights[torch.arange(bsz)[:, None], :, indices].mT
     else:
@@ -495,12 +624,163 @@ def visualize_attention_sink_decay(
             )
         ax.set_xlabel(f"Sorted attention sinks")
         # ax.set_yscale("log")
-        ax.set_title(f"Image {image_idx}")
-        ax.legend()
+        ax.set_title(f"Image {image_idx}", fontsize="x-large")
+        ax.legend(fontsize=8, loc="upper right")
         
-    fig.suptitle(title)
+    fig.suptitle(title, fontsize="xx-large", y=1.02)
     plt.show()
     plt.close()
+
+
+def visualize_attention_sink_decay_by_type(
+    attention_weights_dict: Dict[str, torch.Tensor],
+    ranked_AS_mask: torch.Tensor,
+    mode_dict: Dict[str, str],
+    title: str,
+    k: int = 20,
+    use_cls_proxy: bool = True,
+    cmap: str = "magma",
+    max_labels: int = 6,
+    save_dir: str = None,
+    **kwargs: Any,
+) -> None:
+    bsz = ranked_AS_mask.shape[0]
+    counts = torch.sum(ranked_AS_mask.isfinite(), dim=1)                                                    # [bsz]
+    indices = torch.topk(ranked_AS_mask, k=k, dim=1, largest=False).indices
+
+    attention_weights_dict = attention_weights_dict.copy()
+    for mask_type, v in attention_weights_dict.items():
+        if v.ndim == 4:
+            if use_cls_proxy:
+                attention_weights_dict[mask_type] = v[:, :, 0, :]
+            else:
+                attention_weights_dict[mask_type] = torch.mean(v, dim=2)
+
+    for image_idx in VISUALIZED_INDICES:    
+        fig, axs = plt.subplots(
+            nrows=1, ncols=len(attention_weights_dict), figsize=(PLOT_SCALE * len(attention_weights_dict) * 1.5, PLOT_SCALE),
+            sharey=True,
+        )
+        for ax_idx, (mask_type, attention_weights) in enumerate(attention_weights_dict.items()):
+            ax: Axes = axs[ax_idx]
+            colors: np.ndarray = matplotlib.colormaps.get_cmap(cmap)(torch.linspace(0.9, 0.0, n_it := (counts[image_idx].item() + 1)).numpy(force=True))
+            
+            mode = mode_dict[mask_type]
+            topk_values = attention_weights[torch.arange(bsz)[:, None], :, indices].mT
+            for it in range(n_it):
+                if it == 0:
+                    label: str = f"No {mode}"
+                elif it < max_labels or it == n_it - 1:
+                    label = f"{mode.capitalize()} {it}"
+                else:
+                    label = None
+                
+                if it in [0, n_it - 1]:
+                    ax.plot(
+                        torch.arange(1, k + 1).numpy(force=True), topk_values[image_idx, it].numpy(force=True),
+                        color=colors[it], zorder=it, marker=".", markersize=16, linewidth=3, label=label, **kwargs,
+                    )
+                else:
+                    ax.plot(
+                        torch.arange(1, k + 1).numpy(force=True), topk_values[image_idx, it].numpy(force=True),
+                        color=colors[it], zorder=it, marker=".", linewidth=1, label=label, **kwargs,
+                    )
+            ax.grid(axis="both", color="gray", linestyle="--", alpha=0.5)
+                
+            ax.set_xlabel(f"Ranked attention sinks", fontsize=18)
+            ax.set_xticks(torch.arange(1, k + 1, 2).numpy(force=True))
+            ax.set_ylabel("Attention to CLS", fontsize=18)
+            ax.yaxis.set_tick_params(labelbottom=True)
+            ax.set_title(mask_type, fontsize=20)
+            ax.legend(fontsize=16, loc="upper right")
+            
+        fig.suptitle(title, fontsize=24, y=1.02)
+        if save_dir is not None:
+            plt.savefig(f"{save_dir}/attention_sink_decay_image{image_idx}.pdf", bbox_inches="tight")
+        plt.show()
+        plt.close()
+
+
+
+
+def visualize_layer_output_decay_by_type(
+    layer_output_dict: Dict[str, torch.Tensor],
+    ranked_AS_mask: torch.Tensor,
+    mode_dict: Dict[str, str],
+    title: str,
+    k: int = 20,
+    use_cls_proxy: bool = True,
+    cmap: str = "magma",
+    max_labels: int = 6,
+    save_dir: str = None,
+    **kwargs: Any,
+) -> None:
+    bsz = ranked_AS_mask.shape[0]
+    counts = torch.sum(ranked_AS_mask.isfinite(), dim=1)                                                    # [bsz]
+    indices = torch.topk(ranked_AS_mask, k=k, dim=1, largest=False).indices
+
+    layer_output_dict = {k: torch.norm(v, dim=-1) for k, v in layer_output_dict.items()}
+
+
+
+    for image_idx in VISUALIZED_INDICES:    
+        fig, axs = plt.subplots(
+            nrows=1, ncols=len(layer_output_dict), figsize=(PLOT_SCALE * len(layer_output_dict) * 1.5, PLOT_SCALE),
+            sharey=True,
+        )
+        for ax_idx, (mask_type, layer_output) in enumerate(layer_output_dict.items()):
+            ax: Axes = axs[ax_idx]
+            colors: np.ndarray = matplotlib.colormaps.get_cmap(cmap)(torch.linspace(0.9, 0.0, n_it := (counts[image_idx].item() + 1)).numpy(force=True))
+            
+            mode = mode_dict[mask_type]
+            topk_values = layer_output[torch.arange(bsz)[:, None], :, indices].mT
+            
+            for it in range(n_it):
+                if it == 0:
+                    label: str = f"No {mode}"
+                elif it < max_labels or it == n_it - 1:
+                    label = f"{mode.capitalize()} {it}"
+                else:
+                    label = None
+                
+                if it in [0, n_it - 1]:
+                    ax.plot(
+                        torch.arange(1, k + 1).numpy(force=True), topk_values[image_idx, it].numpy(force=True),
+                        color=colors[it], zorder=it, marker=".", markersize=16, linewidth=3, label=label, **kwargs,
+                    )
+                else:
+                    ax.plot(
+                        torch.arange(1, k + 1).numpy(force=True), topk_values[image_idx, it].numpy(force=True),
+                        color=colors[it], zorder=it, marker=".", linewidth=1, label=label, **kwargs,
+                    )
+            ax.grid(axis="both", color="gray", linestyle="--", alpha=0.5)
+            
+            
+            ax.set_xlabel(f"Ranked attention sinks", fontsize=18)
+            ax.set_xticks(torch.arange(1, k + 1, 2).numpy(force=True))
+            ax.set_ylabel("Block Output Norm", fontsize=18)
+            ax.yaxis.set_tick_params(labelbottom=True)
+            ax.set_title(mask_type, fontsize=20)
+            ax.legend(fontsize=16, loc="upper right")
+            
+            # ax.set_xlabel(f"Unmasked Block Output Norm")
+            # ax.set_xscale("functionlog", functions=[np.log, np.exp])
+            # # ax.set_xticks(torch.arange(0, k + 1, 2).numpy(force=True))
+            # ax.yaxis.set_tick_params(labelbottom=True)
+            # # ax.set_yscale("log")
+            # ax.set_yscale("functionlog", functions=[np.log, np.exp])
+            # ax.set_title(mask_type, fontsize="x-large")
+            # ax.legend(fontsize=8, loc="upper right")
+            
+        fig.suptitle(title, fontsize=24, y=1.02)
+        if save_dir is not None:
+            plt.savefig(f"{save_dir}/layer_output_decay_image{image_idx}.pdf", bbox_inches="tight")
+        plt.show()
+        plt.close()
+
+
+
+        
 
 
 def visualize_attention_weights_per_image(

@@ -11,7 +11,7 @@ from modeling.openclip_vit import OpenCLIPViT
 
 
 class MAClassifier(nn.Module):
-    def __init__(self, model: CLIP = None, start: int = 10, end: int = 12):
+    def __init__(self, model: CLIP, start: int, end: int):
         super().__init__()
         if model is None:
             model = open_clip.create_model_and_transforms(**OpenCLIPViT.INITIALIZE_KWARGS)[0]
@@ -30,8 +30,8 @@ class MAClassifier(nn.Module):
         for bias, ln, mlp in zip(self.biases, self.lns, self.mlps):
             x = x + bias.to(device)
             x = x + mlp.to(device)(ln.to(device)(x))
-        # return x
-        return torch.norm(x, dim=-1)
+        return x
+        # return torch.norm(x, dim=-1)
 
 
 

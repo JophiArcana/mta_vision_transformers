@@ -90,7 +90,7 @@ class Monitor(object):
                         regex_components.append(subattr)
                     else:
                         regex_components.append(f"{subattr}(\\.\\d+|)")
-                regex = "\\.".join(reversed(regex_components))
+                regex = "^" + "\\.".join(reversed(regex_components)) + "$"
                 
                 found_modules: Set[str] = set()
                 for parameter_name, _ in utils.named_modules(self.model):
