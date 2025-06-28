@@ -28,6 +28,11 @@ class OpenCLIPUltraFastNystromCompressionViT(OpenCLIPViT):
         "spectral_clustering",
     ]
     
+    CompressionModeOptions = Literal[
+        "nystrom",
+        "linear",
+    ]
+    
     @classmethod
     def return_module_name(cls, handle: str) -> str:
         return f"return_{handle}"
@@ -60,6 +65,7 @@ class OpenCLIPUltraFastNystromCompressionViT(OpenCLIPViT):
     def __init__(
         self,
         mode: ModeOptions,
+        compression_mode: CompressionModeOptions,
         num_sample: int,
         resample: bool,
         use_layer_input: bool,
@@ -67,6 +73,7 @@ class OpenCLIPUltraFastNystromCompressionViT(OpenCLIPViT):
     ):
         OpenCLIPViT.__init__(self)
         self.mode: OpenCLIPUltraFastNystromCompressionViT.ModeOptions = mode
+        self.compression_mode: OpenCLIPUltraFastNystromCompressionViT.CompressionModeOptions = compression_mode
         self.num_sample: int = num_sample
         self.resample: bool = resample
         self.use_layer_input: bool = use_layer_input
@@ -87,45 +94,26 @@ class OpenCLIPUltraFastNystromCompressionViT(OpenCLIPViT):
             is_causal: bool = False,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
             assert key is query and value is query, "Only implemented for k_x and v_x as None"
-            mask_dict: Dict[str, torch.Tensor] = self._cache.get("mask_dict", {})
             
-            sample_input = query
-            query, key, value = einops.rearrange(
-                Fn.linear(query, _self.in_proj_weight, _self.in_proj_bias),
-                "b n (qkv h d) -> qkv b h n d", qkv=3, h=_self.num_heads,
-            )
+            bsz = query.shape[0]
             
-            # SECTION: Construct the queries and keys used to extrapolate the attention matrix            
+            # SECTION: Construct the queries and keys used to extrapolate the attention matrix
+            sample_input = query           
             if self.use_layer_input:
                 sample_input: torch.Tensor = self._cache.pop("layer_input")
-               
-            bsz = query.shape[0]
-            head_dim = query.shape[-1]
-            invsqrt_d = head_dim ** -0.5
-            
-            bsz_index = torch.arange(bsz)[:, None]
-            def index(t: torch.Tensor, sample_indices: torch.Tensor) -> torch.Tensor:
-                return t[bsz_index, :, sample_indices, :].transpose(dim0=1, dim1=2)
+            N = sample_input.shape[1] - 1
 
-            def mean(t: torch.Tensor, cluster_indices: torch.Tensor, num_centers: int) -> torch.Tensor:
-                cluster_mask = (cluster_indices[..., None] == torch.arange(num_centers))        # bool: [bsz x n x num_centers]
-                cluster_sums = torch.sum(einops.rearrange(
-                    t, "bsz ... n d -> ... bsz n 1 d"
-                ) * cluster_mask[..., None], dim=-3)                                            # float: [... x bsz x num_centers x d]
-                cluster_counts = torch.sum(cluster_mask, dim=1)                                 # int: [bsz x num_centers]
-                return einops.rearrange(cluster_sums / cluster_counts[..., None], "... bsz s d -> bsz ... s d")
-                
+            # SECTION: Construct function that outputs landmark features
             restricted_samples: int = self.num_sample - 1
             if self.mode in ["fps", "uniform", "multiclass_spectral_clustering"]:
-
+                
                 sample_indices = self._cache.get("sample_indices", None)
                 if self.resample or sample_indices is None:
-        
                     if self.mode == "fps": 
                         sample_indices = sample_farthest_points(sample_input[:, 1:], K=restricted_samples)[1] + 1                   # int: [bsz x max_restricted_samples]
      
                     elif self.mode == "uniform":
-                        sample_indices = torch.topk(torch.rand((bsz, ImageFeatures.N)), k=restricted_samples, dim=1).indices + 1    # int: [bsz x max_restricted_samples]
+                        sample_indices = torch.topk(torch.rand((bsz, sample_input.shape[1] - 1)), k=restricted_samples, dim=1).indices + 1  # int: [bsz x max_restricted_samples]
 
                     elif self.mode == "multiclass_spectral_clustering":
                         NC = OpenCLIPUltraFastNystromCompressionViT.supply_ncut(restricted_samples)
@@ -140,14 +128,14 @@ class OpenCLIPUltraFastNystromCompressionViT(OpenCLIPViT):
 
                     sample_indices = torch.cat((torch.full((bsz, 1), 0), sample_indices), dim=1)                    
                     self.update_cache({"sample_indices": sample_indices})
-                    
-                qp, kp = index(query, sample_indices), index(key, sample_indices)
-
+                
+                def reduction(t: torch.Tensor) -> torch.Tensor:
+                    return t[torch.arange(bsz)[:, None], :, sample_indices, :].transpose(dim0=1, dim1=2)
 
             elif self.mode in ["kmeans", "segment_means", "spectral_clustering"]:
                 
-                cluster_indices = torch.full((bsz, ImageFeatures.N + 1), -1)                        # int: [bsz x N]
                 if self.mode in ["kmeans", "spectral_clustering"]:
+                    cluster_indices = torch.full((bsz, N + 1), 0)
                     if self.mode == "spectral_clustering":
                         NC = OpenCLIPUltraFastNystromCompressionViT.supply_ncut(self.num_sample)
                         restricted_sample_input = NC.fit_transform(sample_input[:, 1:, :])
@@ -158,25 +146,51 @@ class OpenCLIPUltraFastNystromCompressionViT(OpenCLIPViT):
                     from cuml import KMeans
                     KM = KMeans(n_clusters=restricted_samples)
                     for image_idx in range(bsz):
-                        cluster_indices[image_idx, 1:] = torch.tensor(KM.fit_predict(restricted_sample_input[image_idx]), dtype=torch.int64)
-                         
-                    qp = torch.cat((mean(query, cluster_indices, restricted_samples), query[:, :, 0:1, :]), dim=2)  # float: [bsz x h x num_sample x d]
-                    kp = torch.cat((mean(key, cluster_indices, restricted_samples), key[:, :, 0:1, :]), dim=2)      # float: [bsz x h x num_sample x d]
-                
+                        cluster_indices[image_idx, 1:] = torch.tensor(KM.fit_predict(restricted_sample_input[image_idx])) + 1
+
                 elif self.mode == "segment_means":
-                    cluster_indices[:, 1:] = torch.arange(ImageFeatures.N, dtype=torch.int64) // (ImageFeatures.N // self.num_sample)
-                    qp, kp = mean(query, cluster_indices, self.num_sample), mean(key, cluster_indices, self.num_sample)
-                
+                    cluster_indices = torch.full((bsz, N + 1), -1)
+                    cluster_indices[:, 1:] = torch.arange(N) // (N // self.num_sample)
+
                 else:
                     raise ValueError(self.mode)
+
+                def reduction(t: torch.Tensor) -> torch.Tensor:
+                    cluster_mask = (cluster_indices[..., None] == torch.arange(self.num_sample))    # bool: [bsz x n x num_centers]
+                    cluster_sums = torch.sum(einops.rearrange(
+                        t, "bsz ... n d -> ... bsz n 1 d"
+                    ) * cluster_mask[..., None], dim=-3)                                            # float: [... x bsz x num_centers x d]
+                    cluster_counts = torch.sum(cluster_mask, dim=1)                                 # int: [bsz x num_centers]
+                    return einops.rearrange(cluster_sums / cluster_counts[..., None], "... bsz s d -> bsz ... s d")
                 
             else:
                 raise ValueError(self.mode)
-                
-            A = torch.softmax(invsqrt_d * (qp @ kp.mT), dim=-1)                                     # float: [bsz x h x num_sample x num_sample]
-            B = torch.softmax((invsqrt_d * qp) @ key.mT, dim=-1)                                    # float: [bsz x h x num_sample x N]
-            BT = torch.softmax(query @ (invsqrt_d * kp.mT), dim=-1)                                 # float: [bsz x h x N x num_sample]
-            x = (BT @ OpenCLIPUltraFastNystromCompressionViT.invert(A)) @ (B @ value)               # float: [bsz x h x N x d]
+
+
+            invsqrt_d = _self.head_dim ** -0.5
+            query, key, value = einops.rearrange(
+                Fn.linear(query, _self.in_proj_weight, _self.in_proj_bias),
+                "b n (qkv h d) -> qkv b h n d", qkv=3, h=_self.num_heads,
+            )
+
+            if self.compression_mode == "nystrom":
+                qp, kp = reduction(query), reduction(key)
+                A = torch.softmax(invsqrt_d * (qp @ kp.mT), dim=-1)                 # float: [bsz x h x num_sample x num_sample]
+                BT = torch.softmax(query @ (invsqrt_d * kp.mT), dim=-1)             # float: [bsz x h x N x num_sample]
+                BV = Fn.scaled_dot_product_attention(qp, key, value)                # float: [bsz x h x num_sample x d]
+                x = BT @ (OpenCLIPUltraFastNystromCompressionViT.invert(A) @ BV)    # float: [bsz x h x N x d]
+            
+            elif self.compression_mode == "linear":
+                kp, vp = reduction(key), reduction(value)
+                x = Fn.scaled_dot_product_attention(query, kp, vp)                  # float: [bsz x h x N x d]
+
+            else:
+                raise ValueError(self.compression_mode)
+
+            # AinvBV = OpenCLIPUltraFastNystromCompressionViT.invert(A) @ BV                          # float: [bsz x h x num_sample x d]
+            # out_proj_weight = einops.rearrange(_self.out_proj.weight, "D (h d) -> h d D", h=_self.num_heads)    # float: [h x d x D]
+            # AinvBVout = AinvBV @ out_proj_weight[None]                                              # float: [bsz x h x num_sample x D]
+            # x = torch.sum(BT @ AinvBVout, dim=1) + _self.out_proj.bias                              # float: [bsz x N x D]
 
             x = einops.rearrange(x, "b h n d -> b n (h d)")
             x = _self.out_proj(x)

@@ -10,7 +10,7 @@ SEED: int = 1149496617
 # SEED: int = int(np.random.randint(0, np.iinfo(np.int32).max))   # 27579224
 print(f"Seed: {SEED}")
 
-DEVICE: str = "cuda:0"
+DEVICE: str = "cuda:1"
 OUTPUT_DEVICE: str = "cpu"
 DTYPE: torch.dtype = torch.float32
 PROJECT_NAME: str = "mta_vision_transformers"
