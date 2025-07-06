@@ -12,7 +12,7 @@ from torch_pca import PCA
 
 from infrastructure.settings import SEED, DEVICE
 from modeling.image_features import ImageFeatures
-from modeling.openclip_vit import OpenCLIPViT
+from modeling.base_vit import OpenCLIPViT
 
 
 

@@ -60,7 +60,7 @@ def new_attention_forward(
                         sample_indices = torch.topk(torch.rand((bsz, ImageFeatures.N)), k=restricted_samples, dim=1).indices + 1    # int: [bsz x max_restricted_samples]
 
                     elif self.mode == "multiclass_spectral_clustering":
-                        NC = OpenCLIPUltraFastNystromCompressionViT.supply_ncut(restricted_samples)
+                        NC = OpenCLIPNystromCompressionViT.supply_ncut(restricted_samples)
                         AA = AxisAlign(sort_method="marginal_norm")
 
                         ncut_features = NC.fit_transform(sample_input[:, 1:, :])                            # float: [bsz x N x num_sample]
@@ -80,7 +80,7 @@ def new_attention_forward(
                 cluster_indices = torch.full((bsz, ImageFeatures.N + 1), -1)                        # int: [bsz x N]
                 if self.mode in ["kmeans", "spectral_clustering"]:
                     if self.mode == "spectral_clustering":
-                        NC = OpenCLIPUltraFastNystromCompressionViT.supply_ncut(self.num_sample)
+                        NC = OpenCLIPNystromCompressionViT.supply_ncut(self.num_sample)
                         restricted_sample_input = NC.fit_transform(sample_input[:, 1:, :])
                     else:
                         restricted_sample_input = sample_input[:, 1:, :]
@@ -108,17 +108,17 @@ def new_attention_forward(
             BT = torch.softmax(query @ (invsqrt_d * kp.mT), dim=-1)                                 # float: [bsz x h x N x num_sample]
             BV = Fn.scaled_dot_product_attention(qp, key, value)                                    # float: [bsz x h x num_sample x d]
             
-            # AinvBV = OpenCLIPUltraFastNystromCompressionViT.invert(A) @ BV                          # float: [bsz x h x num_sample x d]
+            # AinvBV = OpenCLIPNystromCompressionViT.invert(A) @ BV                          # float: [bsz x h x num_sample x d]
             # out_proj_weight = einops.rearrange(_self.out_proj.weight, "D (h d) -> h d D", h=_self.num_heads)    # float: [h x d x D]
             # AinvBVout = AinvBV @ out_proj_weight[None]                                              # float: [bsz x h x num_sample x D]
             # x = torch.sum(BT @ AinvBVout, dim=1) + _self.out_proj.bias                              # float: [bsz x N x D]
             
-            x = BT @ (OpenCLIPUltraFastNystromCompressionViT.invert(A) @ BV)                        # float: [bsz x h x N x d]
+            x = BT @ (OpenCLIPNystromCompressionViT.invert(A) @ BV)                        # float: [bsz x h x N x d]
             x = einops.rearrange(x, "b h n d -> b n (h d)")
             x = _self.out_proj(x)
             
             for k in self.attention_returns:
-                _self.get_submodule(OpenCLIPUltraFastNystromCompressionViT.return_module_name(k))(locals()[k])
+                _self.get_submodule(OpenCLIPViT.return_module_name(k))(locals()[k])
             return x,
 
 

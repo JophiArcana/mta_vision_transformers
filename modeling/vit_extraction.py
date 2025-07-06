@@ -10,7 +10,7 @@ from open_clip.transformer import Transformer
 from infrastructure import utils
 from infrastructure.settings import DEVICE
 from modeling.image_features import ImageFeatures
-from modeling.openclip_vit import OpenCLIPViT
+from modeling.base_vit import OpenCLIPViT
 
 
 

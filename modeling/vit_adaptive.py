@@ -14,18 +14,13 @@ from core.monitor import Monitor
 from core.attention_sink import mask_attention_sink
 from infrastructure import utils
 from infrastructure.settings import DEVICE
+from modeling.base_vit import BaseViT, OpenCLIPViT
 from modeling.image_features import ImageFeatures
-from modeling.openclip_vit import OpenCLIPViT
-
 
 
 class OpenCLIPAdaptiveViT(OpenCLIPViT):
     ModeOptions = Literal["sink", "mask"]
     ExtractOptions = Literal["MA", "AS"]
-    
-    @classmethod
-    def return_module_name(cls, handle: str) -> str:
-        return f"return_{handle}"
 
     @classmethod
     def _attention_matrix_hook_fn(cls, model_: nn.Module, input_: Any, output_: Any) -> Any:
@@ -84,13 +79,13 @@ class OpenCLIPAdaptiveViT(OpenCLIPViT):
             x = F.linear(x, _self.out_proj.weight, _self.out_proj.bias)
                 
             for k in self.attention_returns:
-                _self.get_submodule(OpenCLIPAdaptiveViT.return_module_name(k))(locals()[k])
+                _self.get_submodule(BaseViT.return_module_name(k))(locals()[k])
             return x,
         
         for idx, blk in enumerate(self.model.visual.transformer.resblocks):
             blk: ResidualAttentionBlock
             for handle in self.attention_returns:
-                blk.attn.register_module(OpenCLIPAdaptiveViT.return_module_name(handle), nn.Identity())
+                blk.attn.register_module(BaseViT.return_module_name(handle), nn.Identity())
             blk.attn.forward = types.MethodType(new_attn_forward, blk.attn)
 
 
@@ -145,10 +140,10 @@ class OpenCLIPAdaptiveViT(OpenCLIPViT):
                 x = r(x)
             
             for k in self.forward_returns:
-                _self.get_submodule(OpenCLIPAdaptiveViT.return_module_name(k))(locals()[k])
+                _self.get_submodule(BaseViT.return_module_name(k))(locals()[k])
             return x
         
         self.model.visual.transformer.forward = types.MethodType(new_transformer_forward, self.model.visual.transformer)
         for handle in self.forward_returns:
-            self.model.visual.transformer.register_module(OpenCLIPAdaptiveViT.return_module_name(handle), nn.Identity())
+            self.model.visual.transformer.register_module(BaseViT.return_module_name(handle), nn.Identity())
     

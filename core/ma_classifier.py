@@ -7,7 +7,7 @@ import torch.nn.functional as Fn
 from open_clip.model import CLIP
 from open_clip.transformer import ResidualAttentionBlock
 
-from modeling.openclip_vit import OpenCLIPViT
+from modeling.base_vit import OpenCLIPViT
 
 
 class MAClassifier(nn.Module):

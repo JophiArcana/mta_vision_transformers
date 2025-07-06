@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from infrastructure.settings import DEVICE
-from modeling.openclip_vit import OpenCLIPViT
+from modeling.base_vit import OpenCLIPViT
 
 
 class ImageDataset(Dataset):

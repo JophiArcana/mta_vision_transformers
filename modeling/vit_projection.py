@@ -8,7 +8,7 @@ import torch.nn.functional as Fn
 from open_clip.transformer import ResidualAttentionBlock, Transformer
 
 from infrastructure.settings import SEED, DEVICE
-from modeling.openclip_vit import OpenCLIPViT
+from modeling.base_vit import BaseViT, OpenCLIPViT
 from modeling.vit_attention import OpenCLIPAttentionViT
 
 
@@ -107,7 +107,7 @@ class OpenCLIPProjectionViT(OpenCLIPAttentionViT):
                 value_subspace = einops.rearrange(V, "bsz (h n) d -> bsz h n d", h=_self.num_heads)
 
                 for k in self.attention_returns:
-                    _self.get_submodule(OpenCLIPProjectionViT.return_module_name(k))(locals()[k])
+                    _self.get_submodule(BaseViT.return_module_name(k))(locals()[k])
                 return attn_out,
             return forward
         
@@ -117,7 +117,7 @@ class OpenCLIPProjectionViT(OpenCLIPAttentionViT):
         for idx, blk in enumerate(self.model.visual.transformer.resblocks):
             blk: ResidualAttentionBlock
             for handle in self.attention_returns:
-                blk.attn.register_module(OpenCLIPProjectionViT.return_module_name(handle), nn.Identity())
+                blk.attn.register_module(BaseViT.return_module_name(handle), nn.Identity())
             blk.forward = types.MethodType(get_resblock_forward_func_for_layer(idx), blk)
             blk.attn.forward = types.MethodType(get_attention_forward_func_for_layer(idx), blk.attn)
 

@@ -10,7 +10,7 @@ from open_clip.transformer import ResidualAttentionBlock, Transformer
 
 from infrastructure.settings import SEED, DEVICE
 from modeling.image_features import ImageFeatures
-from modeling.openclip_vit import OpenCLIPViT
+from modeling.base_vit import BaseViT, OpenCLIPViT
 
 
 
@@ -19,10 +19,6 @@ class OpenCLIPCompressionViT(OpenCLIPViT):
         "default",
         "compression",
     ]
-    
-    @classmethod
-    def return_module_name(cls, handle: str) -> str:
-        return f"return_{handle}"
     
     def __init__(
         self,
@@ -91,14 +87,14 @@ class OpenCLIPCompressionViT(OpenCLIPViT):
                 x = F.linear(x, _self.out_proj.weight, _self.out_proj.bias)
                     
                 for k in self.attention_returns:
-                    _self.get_submodule(OpenCLIPCompressionViT.return_module_name(k))(locals()[k])
+                    _self.get_submodule(BaseViT.return_module_name(k))(locals()[k])
                 return x,
             return attention
         
         for idx, blk in enumerate(self.model.visual.transformer.resblocks):
             blk: ResidualAttentionBlock
             for handle in self.attention_returns:
-                blk.attn.register_module(OpenCLIPCompressionViT.return_module_name(handle), nn.Identity())
+                blk.attn.register_module(BaseViT.return_module_name(handle), nn.Identity())
             blk.attn.forward = types.MethodType(get_attention_forward_func_for_layer(idx), blk.attn)
         
         

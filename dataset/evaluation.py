@@ -15,7 +15,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 from infrastructure import utils
 from infrastructure.settings import DEVICE
 from dataset.library import DATASETS
-from modeling.openclip_vit import OpenCLIPViT
+from modeling.base_vit import OpenCLIPViT
 
 
 # COCO-2017 dataset
