@@ -63,18 +63,35 @@ class NystromCompressionViT(BaseViT):
     def __init__(
         self,
         mode: ModeOptions,
-        compression_mode: CompressionModeOptions = "nystrom",
-        num_sample: int = 32,
-        resample: bool = False,
-        use_layer_input: bool = True,
-        mask_layers: Iterable[int] = range(13, 24),
+        compression_mode: CompressionModeOptions,
+        num_sample: int,
+        resample: bool,
+        use_layer_input: bool,
+        
+        target_layer_cls: type,
+        target_attention_cls: type,
+        condition: Callable[[str, nn.Module], bool],
+        new_forward: Callable,
     ):
         self.mode: NystromCompressionViT.ModeOptions = mode
         self.compression_mode: NystromCompressionViT.CompressionModeOptions = compression_mode
         self.num_sample: int = num_sample
         self.resample: bool = resample
         self.use_layer_input: bool = use_layer_input
-        self.mask_layers: List[int] = [*mask_layers]
+
+        found_modules = []
+        for name, module in self.named_modules():
+            if isinstance(module, target_layer_cls) and module not in found_modules and condition(name, module):
+                attention_modules = [child for child in module.modules() if isinstance(child, target_attention_cls)]
+                assert len(attention_modules) == 1, f"Expected each layer to have only one attention module but got {len(attention_modules)}."
+                for attention_module in attention_modules:
+                    attention_module.forward = types.MethodType(new_forward, attention_module)
+                if self.use_layer_input:
+                    module.register_forward_pre_hook(self.register_layer_input)
+                found_modules.append(module)
+        
+    def register_layer_input(self, module: nn.Module, input: Any):
+        self.update_cache({"layer_input": input[0]})
     
     def get_reduction_func(
         self,
@@ -182,12 +199,25 @@ class NystromCompressionViT(BaseViT):
 
 
 class OpenCLIPNystromCompressionViT(OpenCLIPViT, NystromCompressionViT):
-    def __init__(self, *args: Any, **kwargs: Any):
+    def __init__(
+        self,
+        mode: NystromCompressionViT.ModeOptions,
+        compression_mode: NystromCompressionViT.CompressionModeOptions = "nystrom",
+        num_sample: int = 32,
+        resample: bool = False,
+        use_layer_input: bool = True,
+        mask_layers: Iterable[int] = range(13, 24),
+    ):
         OpenCLIPViT.__init__(self)
-        NystromCompressionViT.__init__(self, *args, **kwargs)
-        self.attention_returns: List[str] = []  # ["sample_indices"]
 
-        # SECTION: Replace resblock.attn.forward
+        # SECTION: Replace resblock.attn.forward        
+        def condition(name: str, module: nn.Module) -> bool:
+            allowed_names = {
+                f"model.visual.transformer.resblocks.{idx}"
+                for idx in mask_layers
+            }
+            return name in allowed_names
+
         def new_attention_forward(
             _self: nn.MultiheadAttention,
             query: torch.Tensor,
@@ -213,32 +243,42 @@ class OpenCLIPNystromCompressionViT(OpenCLIPViT, NystromCompressionViT):
             for k in self.attention_returns:
                 _self.get_submodule(BaseViT.return_module_name(k))(locals()[k])
             return x,
-        
-        for idx in self.mask_layers:
-            blk: ResidualAttentionBlock = self.model.visual.transformer.resblocks[idx]
-            for handle in self.attention_returns:
-                blk.attn.register_module(BaseViT.return_module_name(handle), nn.Identity())
-            blk.attn.forward = types.MethodType(new_attention_forward, blk.attn)
-    
-    
-        # SECTION: Replace transformer.forward
-        def new_transformer_forward(_self: Transformer, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-            for r in _self.resblocks:
-                if self.use_layer_input:
-                    self.update_cache({"layer_input": x})
-                x = r(x, attn_mask=attn_mask)  
-            return x
-        
-        self.model.visual.transformer.forward = types.MethodType(new_transformer_forward, self.model.visual.transformer)
+
+        NystromCompressionViT.__init__(
+            self,
+            mode=mode,
+            compression_mode=compression_mode,
+            num_sample=num_sample,
+            resample=resample,
+            use_layer_input=use_layer_input,
+            target_layer_cls=ResidualAttentionBlock,
+            target_attention_cls=nn.MultiheadAttention,
+            condition=condition,
+            new_forward=new_attention_forward,
+        )
+        self.attention_returns: List[str] = []  # ["sample_indices"]
 
 
 class DINOv2NystromCompressionViT(DINOv2ViT, NystromCompressionViT):
-    def __init__(self, *args: Any, **kwargs: Any):
+    def __init__(
+        self,
+        mode: NystromCompressionViT.ModeOptions,
+        compression_mode: NystromCompressionViT.CompressionModeOptions = "nystrom",
+        num_sample: int = 32,
+        resample: bool = False,
+        use_layer_input: bool = True,
+        mask_layers: Iterable[int] = range(13, 24),
+    ):
         DINOv2ViT.__init__(self)
-        NystromCompressionViT.__init__(self, *args, **kwargs)
-        self.attention_returns: List[str] = []  # ["sample_indices"]
     
         # SECTION: Replace layer.attention.attention.forward
+        def condition(name: str, module: nn.Module) -> bool:
+            allowed_names = {
+                f"model.encoder.layer.{idx}"
+                for idx in mask_layers
+            }
+            return name in allowed_names
+        
         def new_attention_forward(
             _self: Dinov2SelfAttention,
             hidden_states: torch.Tensor,
@@ -258,58 +298,17 @@ class DINOv2NystromCompressionViT(DINOv2ViT, NystromCompressionViT):
             for k in self.attention_returns:
                 _self.get_submodule(BaseViT.return_module_name(k))(locals()[k])
             return outputs
-
-        for idx in self.mask_layers:
-            layer: Dinov2Layer = self.model.encoder.layer[idx]
-            for handle in self.attention_returns:
-                layer.attention.attention.register_module(BaseViT.return_module_name(handle), nn.Identity())
-            layer.attention.attention.forward = types.MethodType(new_attention_forward, layer.attention.attention)
-
-        # SECTION: Replace encoder.forward
-        def new_encoder_forward(
-            _self: Dinov2Encoder,
-            hidden_states: torch.Tensor,
-            head_mask: Optional[torch.Tensor] = None,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-        ) -> Union[tuple, BaseModelOutput]:
-            all_hidden_states = () if output_hidden_states else None
-            all_self_attentions = () if output_attentions else None
-
-            for i, layer_module in enumerate(_self.layer):
-                if output_hidden_states:
-                    all_hidden_states = all_hidden_states + (hidden_states,)
-
-                layer_head_mask = head_mask[i] if head_mask is not None else None
-                
-                if self.use_layer_input:
-                    self.update_cache({"layer_input": hidden_states})
-                if _self.gradient_checkpointing and _self.training:
-                    layer_outputs = _self._gradient_checkpointing_func(
-                        layer_module.__call__,
-                        hidden_states,
-                        layer_head_mask,
-                        output_attentions,
-                    )
-                else:
-                    layer_outputs = layer_module(hidden_states, layer_head_mask, output_attentions)
-
-                hidden_states = layer_outputs[0]
-
-                if output_attentions:
-                    all_self_attentions = all_self_attentions + (layer_outputs[1],)
-
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
-            if not return_dict:
-                return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
-            return BaseModelOutput(
-                last_hidden_state=hidden_states,
-                hidden_states=all_hidden_states,
-                attentions=all_self_attentions,
-            )
         
-        self.model.encoder.forward = types.MethodType(new_encoder_forward, self.model.encoder)
-
+        NystromCompressionViT.__init__(
+            self,
+            mode=mode,
+            compression_mode=compression_mode,
+            num_sample=num_sample,
+            resample=resample,
+            use_layer_input=use_layer_input,
+            target_layer_cls=Dinov2Layer,
+            target_attention_cls=Dinov2SelfAttention,
+            condition=condition,
+            new_forward=new_attention_forward,
+        )
+        self.attention_returns: List[str] = []  # ["sample_indices"]

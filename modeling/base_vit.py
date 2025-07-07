@@ -1,14 +1,9 @@
-import types
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict
 
-import open_clip
 import torch
 import torch.nn as nn
-from open_clip.model import CLIP
-from open_clip.tokenizer import HFTokenizer
 
 from infrastructure.settings import DEVICE
-from transformers import BitImageProcessor, Dinov2Model
 
 
 class BaseViT(nn.Module):
@@ -37,6 +32,14 @@ class BaseViT(nn.Module):
         return "_".join((f"{k[i]}:{v[i]}" for i in range(idx + 1, len(k))))
 
 
+"""
+CLIP
+"""
+import open_clip
+from open_clip.model import CLIP
+from open_clip.tokenizer import HFTokenizer
+
+
 class OpenCLIPViT(BaseViT):    
     INITIALIZE_KWARGS: Dict[str, Any] = {
         "model_name": "ViT-L-14",
@@ -52,8 +55,14 @@ class OpenCLIPViT(BaseViT):
     def __init__(self):
         BaseViT.__init__(self, open_clip.create_model_and_transforms(**OpenCLIPViT.INITIALIZE_KWARGS)[0])
         self.model: CLIP
-        
-        
+
+
+"""
+Dinov2
+"""
+from transformers import BitImageProcessor, Dinov2Model
+
+
 class DINOv2ViT(BaseViT):
     BASE_MODEL_NAME = "facebook/dinov2-large"
     image_processor: BitImageProcessor = BitImageProcessor.from_pretrained(BASE_MODEL_NAME)
@@ -61,3 +70,22 @@ class DINOv2ViT(BaseViT):
     def __init__(self):
         BaseViT.__init__(self, Dinov2Model.from_pretrained(DINOv2ViT.BASE_MODEL_NAME))
         self.model: Dinov2Model
+
+
+
+"""
+Stable diffusion
+"""
+from diffusers import StableDiffusion3Pipeline
+
+
+class StableDiffusion3Pipeline(BaseViT):
+    BASE_MODEL_NAME = "stabilityai/stable-diffusion-3.5-medium"
+    BASE_MODEL_DTYPE = torch.bfloat16
+    
+    def __init__(self):
+        StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3.5-medium", torch_dtype=torch.bfloat16).to(DEVICE)
+        BaseViT.__init__(self, StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3.5-medium", torch_dtype=torch.bfloat16).to(DEVICE))
+
+
+
