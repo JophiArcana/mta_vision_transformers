@@ -1,0 +1,15 @@
+.DS_Store
+.idea/
+.vscode/
+cub-1.10.0/
+output/
+dataset/annotations/
+dataset/coco2017_val.zip
+dataset/val2014*
+dataset/val2017*
+experiments/adaptive/
+experiments/attention/
+experiments/fastnystrom/
+experiments/nystrom/
+evaluation/coco_vqa/v2_mscoco_val2014_annotations.json
+
