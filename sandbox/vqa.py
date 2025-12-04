@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
-from openai import OpenAI, RateLimitError
+# from openai import OpenAI, RateLimitError
 from PIL import Image
 
 from infrastructure import utils
@@ -201,7 +201,7 @@ if __name__ == "__main__":
     start_layers = [12, 14, 16, 18, 20,]
     num_samples = [16, 32, 64, 128, 256, 512]
     model_kwargs_dict = [("baseline", {"mask_layers": range(hi, hi + 1), "num_sample": 64,})] + [
-        (f"L[{lo}:{hi}]_S{num_sample}", {"mask_layers": range(lo, hi), "num_sample": num_sample,})
+        (f"L[{lo}:{hi}]_S{num_sample}_OFPS", {"mask_layers": range(lo, hi), "num_sample": num_sample,})
         for lo in start_layers for num_sample in num_samples
     ]
     
@@ -220,7 +220,7 @@ if __name__ == "__main__":
     cdict = {hi: "black", **{l: COLORS[i] for i, l in enumerate(start_layers)}}
     print(cdict)
     for model_name, model_kwargs in model_kwargs_dict:
-        model = None # LlavaNextNystromCompressionViT("fps", **model_kwargs)
+        model = LlavaNextNystromCompressionViT("fps", **model_kwargs)
         # outputs, reviews, score_dict = run_vqa_evaluation(model, model_name)
         outputs, score_dict = run_vqa_evaluation(model, model_name)
         

@@ -74,29 +74,38 @@ class NystromCompressionViT(BaseViT):
         self.resample: bool = resample
         self.use_layer_input: bool = use_layer_input
 
-        for target_transformer_cls, target_layer_cls, target_attention_cls, fn in targets:
-            # print(target_layer_cls, target_attention_cls)
-            # print("=" * 120)
-            tname, transformer = None, None
-            for name, module in utils.named_modules(self):
-                if isinstance(module, target_transformer_cls):
-                    tname, transformer = name, module
-                    break
-        
-            found_modules = []
-            for name, module in utils.named_modules(transformer):
-                if isinstance(module, target_layer_cls) and module not in found_modules:
-                    attention_modules = [
-                        (cname, child) for (cname, child) in utils.named_modules(module)
-                        if isinstance(child, target_attention_cls) and condition(child, f"{tname}.{name}.{cname}")
-                    ]
-                    for cname, attention_module in attention_modules:
-                        # print(f"{tname}.{name}.{cname}")
-                        attention_module.forward = types.MethodType(fn, attention_module)
-                    if self.use_layer_input:
-                        module.register_forward_pre_hook(self.register_layer_input, with_kwargs=True)
-                    found_modules.append(module)
-            # print()
+        def find_targets(module: nn.Module, target_classes: tuple[type, ...]) -> list[tuple[str, nn.Module]]:
+            target_cls = target_classes[0]
+            targets = [(cname, cmodule,) for cname, cmodule in utils.named_modules(module) if isinstance(cmodule, target_cls)]
+            if len(target_classes) == 1:
+                return targets
+            else:
+                target_classes = target_classes[1:]
+                result = []
+                for cname, cmodule in targets:
+                    result.extend([
+                        (f"{cname}.{ccname}", ccmodule,)
+                        for ccname, ccmodule in find_targets(cmodule, target_classes)
+                    ])
+                return result
+
+        for target_classes, fn in targets:
+            tname, transformer = find_targets(self, target_classes[:1])[0]
+            targets = []
+            if self.use_layer_input:
+                for layer_name, layer_module in find_targets(transformer, target_classes[1:-1]):
+                    for name, module in find_targets(layer_module, target_classes[-1:]):
+                        if condition(module, f"{tname}.{layer_name}.{name}"):
+                            # module.is_modified_forward = True
+                            module.forward = types.MethodType(fn, module)
+                            
+                    layer_module.register_forward_pre_hook(self.register_layer_input, with_kwargs=True)
+            else:
+                targets.extend()
+                for name, module in find_targets(transformer, target_classes[1:]):
+                    if condition(module, f"{tname}.{name}"):
+                        # module.is_modified_forward = True
+                        module.forward = types.MethodType(fn, module)
 
             TIME_KEY = f"{tname}_time"
             def timer_pre_hook(*args: Any) -> None:
@@ -112,7 +121,7 @@ class NystromCompressionViT(BaseViT):
                 to_delete = [k for k in self._cache.keys() if k not in ([TIME_KEY] + preserve_keys)]
                 for k in to_delete:
                     del self._cache[k]
-            transformer.register_forward_hook(reset_cache)
+            transformer.reset_cache_handle = transformer.register_forward_hook(reset_cache)
 
     def register_layer_input(self, module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
         self.update_cache({self.LAYER_INPUT: (args, kwargs)})
@@ -221,10 +230,9 @@ class NystromCompressionViT(BaseViT):
                 invsqrt_d = query.shape[-1] ** -0.5
                 qp, kp = reduction(query), reduction(key)
                 A = torch.softmax(invsqrt_d * (qp @ kp.mT), dim=-1)     # float: [bsz x h x num_sample x num_sample]
-                BT = torch.softmax(query @ (invsqrt_d * kp.mT), dim=-1) # float: [bsz x h x N x num_sample]
                 BV = Fn.scaled_dot_product_attention(qp, key, value)    # float: [bsz x h x num_sample x d]
                 vp = NystromCompressionViT.invert(A) @ BV               # float: [bsz x h x num_sample x d]
-                x = BT @ vp                                             # float: [bsz x h x N x d]
+                x = Fn.scaled_dot_product_attention(query, kp, vp)      # float: [bsz x h x N x d]
                 
             case "linear":
                 kp, vp = reduction(key), reduction(value)
@@ -304,7 +312,7 @@ class OpenCLIPNystromCompressionViT(OpenCLIPViT, NystromCompressionViT):
             resample=resample,
             use_layer_input=use_layer_input,
             targets=[
-                (Transformer, ResidualAttentionBlock, nn.MultiheadAttention, new_attention_forward,),
+                ((Transformer, ResidualAttentionBlock, nn.MultiheadAttention,), new_attention_forward,),
             ],
             condition=condition,
         )
@@ -368,7 +376,7 @@ class DINOv2NystromCompressionViT(DINOv2ViT, NystromCompressionViT):
             resample=resample,
             use_layer_input=use_layer_input,
             targets=[
-                (Dinov2Layer, Dinov2SelfAttention, new_attention_forward,),
+                ((Dinov2Layer, Dinov2SelfAttention,), new_attention_forward,),
             ],
             condition=condition,
         )
@@ -377,6 +385,7 @@ class DINOv2NystromCompressionViT(DINOv2ViT, NystromCompressionViT):
 """
 Stable diffusion
 """
+from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
 from diffusers.models.attention import JointTransformerBlock
 from diffusers.models.attention_processor import Attention
 from modeling.base_vit import StableDiffusion3ViT
@@ -384,6 +393,7 @@ from modeling.base_vit import StableDiffusion3ViT
 
 class StableDiffusion3NystromCompressionViT(StableDiffusion3ViT, NystromCompressionViT):
     TIMESTEP_KEY = "counter"
+    TEXT_SAMPLE_INDICES = "text_sample_indices"
     
     def __init__(
         self,
@@ -413,7 +423,7 @@ class StableDiffusion3NystromCompressionViT(StableDiffusion3ViT, NystromCompress
             def timestep_condition(t: int) -> bool:
                 return t < 14
         self.timestep_condition = timestep_condition
-        
+
         def new_attn_forward(
             _self: Attention,
             hidden_states: torch.Tensor,
@@ -489,10 +499,9 @@ class StableDiffusion3NystromCompressionViT(StableDiffusion3ViT, NystromCompress
                     self.update_cache({self.SAMPLE_INDICES: image_sample_indices})
                     
                     if encoder_hidden_states is not None:
-                        TEXT_SAMPLE_INDICES = "text_sample_indices"
                         text_input = self._cache[self.LAYER_INPUT][1]["encoder_hidden_states"] if self.use_layer_input else encoder_hidden_states
-                        text_reduction, text_sample_indices = self.get_reduction_func(text_input, self.num_sample[1], self._cache.get(TEXT_SAMPLE_INDICES))
-                        self.update_cache({TEXT_SAMPLE_INDICES: text_sample_indices})
+                        text_reduction, text_sample_indices = self.get_reduction_func(text_input, self.num_sample[1], self._cache.get(self.TEXT_SAMPLE_INDICES))
+                        self.update_cache({self.TEXT_SAMPLE_INDICES: text_sample_indices})
 
                         def reduction(t: torch.Tensor) -> torch.Tensor:
                             return torch.cat((image_reduction(t[..., :N, :]), text_reduction(t[..., N:, :])), dim=-2)
@@ -543,9 +552,14 @@ class StableDiffusion3NystromCompressionViT(StableDiffusion3ViT, NystromCompress
             resample=resample,
             use_layer_input=use_layer_input,
             targets=[
-                (JointTransformerBlock, Attention, new_attn_forward,),
+                ((SD3Transformer2DModel, JointTransformerBlock, Attention,), new_attn_forward,),
             ],
             condition=condition,
+            preserve_keys=[
+                StableDiffusion3NystromCompressionViT.TIMESTEP_KEY,
+                StableDiffusion3NystromCompressionViT.SAMPLE_INDICES,
+                StableDiffusion3NystromCompressionViT.TEXT_SAMPLE_INDICES,
+            ],
         )
 
 
@@ -561,12 +575,12 @@ from transformers.models.llava_next.modeling_llava_next import (
 from transformers.models.clip.modeling_clip import (
     CLIPEncoder,
     CLIPEncoderLayer,
-    CLIPSdpaAttention,
+    CLIPAttention,
 )
 from transformers.models.llama.modeling_llama import (
     LlamaModel,
     LlamaDecoderLayer,
-    LlamaSdpaAttention,
+    LlamaAttention,
     apply_rotary_pos_emb,
     repeat_kv,
 )
@@ -579,6 +593,8 @@ class LlavaNextNystromCompressionViT(LlavaNextViT, NystromCompressionViT):
         compression_mode: NystromCompressionViT.CompressionModeOptions = "nystrom",
         num_sample: int | Tuple[int, int] = 32,
         resample: bool = False,
+        use_online_fps: bool = False,
+        stream_size: int = 32,
         use_layer_input: bool = True,
         mask_layers: Iterable[int] = range(16, 32),
     ):
@@ -601,7 +617,7 @@ class LlavaNextNystromCompressionViT(LlavaNextViT, NystromCompressionViT):
             return name in allowed_names
 
         def new_clip_self_attn_forward(
-            _self: CLIPSdpaAttention,
+            _self: CLIPAttention,
             hidden_states: torch.Tensor,
             attention_mask: Optional[torch.Tensor] = None,
             causal_attention_mask: Optional[torch.Tensor] = None,
@@ -628,7 +644,7 @@ class LlavaNextNystromCompressionViT(LlavaNextViT, NystromCompressionViT):
             return attn_output, None
 
         def new_llama_self_attn_forward(
-            _self: LlamaSdpaAttention,
+            _self: LlamaAttention,
             hidden_states: torch.Tensor,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
@@ -642,6 +658,8 @@ class LlavaNextNystromCompressionViT(LlavaNextViT, NystromCompressionViT):
             def transpose(t: torch.Tensor) -> torch.Tensor:
                 return einops.rearrange(t, "... n (h d) -> ... h n d", h=_self.num_heads)
 
+            assert hidden_states.ndim == 3
+            bsz = hidden_states.shape[0]
             query_states = transpose(_self.q_proj(hidden_states))
             key_states = transpose(_self.k_proj(hidden_states))
             value_states = transpose(_self.v_proj(hidden_states))
@@ -649,19 +667,62 @@ class LlavaNextNystromCompressionViT(LlavaNextViT, NystromCompressionViT):
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
             
+            reduction_features = self._cache[self.LAYER_INPUT][0][0] if self.use_layer_input else hidden_states
             if hidden_states.shape[-2] > 1:
                 # TODO: compute_compression in this case should be running is_causal = True which is incompatible with Nystrom, think about whether this matters
                 LLAMA_SAMPLE_INDICES = "llama_sample_indices"
                 num_sample = self.num_sample if isinstance(self.num_sample, int) else self.num_sample[1]
-                reduction, sample_indices = self.get_reduction_func(
-                    self._cache[self.LAYER_INPUT][0][0] if self.use_layer_input else hidden_states,
-                    num_sample, self._cache.get(LLAMA_SAMPLE_INDICES),
-                )
+                reduction, sample_indices = self.get_reduction_func(reduction_features, num_sample, self._cache.get(LLAMA_SAMPLE_INDICES))
                 self.update_cache({LLAMA_SAMPLE_INDICES: sample_indices})
 
                 attn_output, (kp, vp) = self.compute_compression(query_states, key_states, value_states, reduction, return_effective_kv=True)
                 past_key_value.update(kp, vp, _self.layer_idx)
 
+            elif use_online_fps:
+                if not hasattr(past_key_value, "stream_increment"):
+                    past_key_value.stream_increment = -1
+                    past_key_value.valid_indices = torch.full((bsz, stream_size + 1,), -1)
+                    past_key_value.fps_features = torch.full((bsz, stream_size + 1, reduction_features.shape[-1],), torch.nan, dtype=reduction_features.dtype)
+
+                if _self.layer_idx == min(mask_layers):
+                    past_key_value.stream_increment += 1
+                    
+                if past_key_value.stream_increment < stream_size:
+                    if _self.layer_idx == min(mask_layers):
+                        past_key_value.valid_indices[:, past_key_value.stream_increment] = past_key_value.stream_increment
+                        past_key_value.fps_features[:, past_key_value.stream_increment, :] = reduction_features[:, 0, :]
+
+                    past_key_value.update(key_states, value_states, _self.layer_idx)
+                else:
+                    if _self.layer_idx == min(mask_layers):
+                        scale = 5000
+                        if past_key_value.stream_increment == stream_size:
+                            open_index = torch.full((bsz,), -1)
+                            past_key_value.fps_features[:, -1, :] = reduction_features[:, 0, :]
+                            past_key_value.exp_dist = torch.exp((-0.5 / scale) * torch.cdist(past_key_value.fps_features, past_key_value.fps_features) ** 2)
+                        else:
+                            open_index = past_key_value.open_index
+                            past_key_value.fps_features[range(bsz), open_index] = reduction_features[:, 0, :]
+                            exp_dist = torch.exp((-0.5 / scale) * torch.cdist(reduction_features, past_key_value.fps_features) ** 2)[:, 0, :]
+                            past_key_value.exp_dist[range(bsz), :, open_index] = exp_dist
+                            past_key_value.exp_dist[range(bsz), open_index, :] = exp_dist
+
+                        past_key_value.open_index = torch.argmax(torch.sum(past_key_value.exp_dist, dim=-1), dim=-1)
+                        kv_index = past_key_value.valid_indices[range(bsz), past_key_value.open_index]
+                        past_key_value.valid_indices[range(bsz), past_key_value.open_index] = -1
+                        past_key_value.valid_indices[range(bsz), open_index] = kv_index
+
+                        past_key_value.to_replace = torch.arange(bsz)[open_index != past_key_value.open_index]
+                        past_key_value.kv_index = (kv_index - stream_size)[past_key_value.to_replace]
+
+                    past_key_value.key_cache[_self.layer_idx][past_key_value.to_replace, :, past_key_value.kv_index, :] = key_states[past_key_value.to_replace, :, 0, :]
+                    past_key_value.value_cache[_self.layer_idx][past_key_value.to_replace, :, past_key_value.kv_index, :] = value_states[past_key_value.to_replace, :, 0, :]
+
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                )                
             else:
                 key_states, value_states = past_key_value.update(key_states, value_states, _self.layer_idx)
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -683,8 +744,8 @@ class LlavaNextNystromCompressionViT(LlavaNextViT, NystromCompressionViT):
             resample=resample,
             use_layer_input=use_layer_input,
             targets=[
-                (CLIPEncoder, CLIPEncoderLayer, CLIPSdpaAttention, new_clip_self_attn_forward,),
-                (LlamaModel, LlamaDecoderLayer, LlamaSdpaAttention, new_llama_self_attn_forward,),
+                ((CLIPEncoder, CLIPEncoderLayer, CLIPAttention,), new_clip_self_attn_forward,),
+                ((LlamaModel, LlamaDecoderLayer, LlamaAttention,), new_llama_self_attn_forward,),
             ],
             condition=condition,
         )
@@ -696,7 +757,7 @@ class LlavaNextNystromCompressionViT(LlavaNextViT, NystromCompressionViT):
             image_sizes: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            past_key_values: Optional[DynamicCache] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             vision_feature_layer: Optional[int] = None,
             vision_feature_select_strategy: Optional[str] = None,
